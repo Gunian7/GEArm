@@ -33,8 +33,8 @@
 
 | 功能模块 | 原版 F407 引脚 | 本项目 MC02 (STM32H723VGT6) 引脚 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **FDCAN1_RX** | PB8 (AF9) | **PA11 (AF9)** | 连接板载 CAN1 收发器（注意：DM-MC02 板载 3 路 CAN，首尾需配 120Ω 终端电阻） |
-| **FDCAN1_TX** | PB9 (AF9) | **PA12 (AF9)** | 连接板载 CAN1 收发器 |
+| **FDCAN1_RX** | PB8 (AF9) | **PD0 (AF9)** | 连接板载 CAN1 收发器（DM-MC02 官方 CtrBoard-H7_FDCAN 示例采用 PD0/PD1） |
+| **FDCAN1_TX** | PB9 (AF9) | **PD1 (AF9)** | 连接板载 CAN1 收发器 |
 | **DEBUG_UART1_TX** | PA9 | **PB14 (AF4)** | 用于上位机控制 / Shell 串口调试 (115200 8N1) |
 | **DEBUG_UART1_RX** | PA10 | **PB15 (AF4)** | 串口命令接收与解析中断 |
 | **USART3_TX** | PB10 | **PB10 (AF7)** | 预留通信 / 辅助串口 (115200 8N1) |
