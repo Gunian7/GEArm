@@ -1,0 +1,23 @@
+# 编译构建与临时文件
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+
+# STM32CubeIDE / Eclipse 项目缓存
+.metadata/
+.settings/language.settings.xml
+*.launch
+_backup_before_freertos/
+Core_backup_before_freertos/
+_cubemx_raw_output/
+*.log
+*.tmp
+*.bak
