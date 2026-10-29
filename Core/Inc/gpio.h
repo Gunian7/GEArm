@@ -40,6 +40,14 @@ void MX_GPIO_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* LimitSwitch_Init() is declared inside this USER CODE block on purpose:
+ * gpio.c defines it inside its own USER CODE region so that a CubeMX
+ * "Generate Code" run cannot wipe it. Keeping the prototype here too means
+ * the declaration survives regeneration as well; putting it next to
+ * MX_GPIO_Init() would delete it and leave main.c with an implicit
+ * declaration. */
+void LimitSwitch_Init(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

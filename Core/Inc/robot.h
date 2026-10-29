@@ -210,6 +210,14 @@ int robot_send_time_func_event(float time_limit_ms);
 uint32_t robot_joint_veloccity_to(uint32_t joint_id, float velocity, uint8_t acceleration);
 HAL_StatusTypeDef CAN_Send_Msg(uint32_t StdId, uint8_t *pData, uint8_t Len);
 
+/* 限位开关轮询（TIM6 1kHz 中断里调用，见 robot.c robot_limit_poll） */
+void robot_limit_poll(void);
+
+/* 急停（见 robot.c 急停小节） */
+void robot_estop_trigger(void);   /* 触发：停所有电机 + 置标志，之后拒绝新动作 */
+void robot_estop_clear(void);     /* 解除：人工显式调用，不会自动恢复 */
+int robot_estop_active(void);     /* 1 = 急停中 */
+
 #ifdef __cplusplus
 }
 #endif

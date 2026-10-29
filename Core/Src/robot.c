@@ -103,6 +103,53 @@ static void robot_joint_stop_from_isr(uint8_t joint_id);
 
 static robot_time_func g_robot_time_func = time_func_circle; /* 时间函数 */
 
+/* -------------------------------------------------------------------------
+ * 急停（2026-10-28 新增）
+ *
+ * 为什么必须有：机械臂持续运动时如果指令发错（逆运动解算出错误关节角、Web 端
+ * 误操作、插值路径异常），机械臂会以默认 10rpm 持续朝错误方向转，可能撞坏结构
+ * 或拉断线。需要一个人能一键、快速、可靠停下来的手段。
+ *
+ * 设计要点：
+ * 1) 必须走非阻塞路径。CAN_Send_Msg() 只是往 FDCAN TX FIFO 入队
+ *    （HAL_FDCAN_GetTxFifoFreeLevel + AddMessageToTxFifoQ，满了返回 HAL_BUSY），
+ *    不等待电机应答，所以 6 个电机的停止命令可以一次性全部发出（微秒级）。
+ *    绝不能用 robot_joint_stop() —— 它 vTaskSuspendAll() 挂起调度器后循环发
+ *    停止命令并等待 CAN 应答、超时才返回，连续调 6 次会让急停本身阻塞最多
+ *    6 × ROBOT_CAN_TIMEOUT，完全违背"急停要快"的初衷。
+ * 2) 同时置 g_estop 标志，让 robot_pid_run() / robot_control_task 中止。
+ *    只给电机发停止是不够的 —— robot_pid_run() 的双层循环还在持续往下发位置
+ *    指令，电机会被重新驱动，等于没停。
+ * 3) 急停后必须显式 estop_clear 才恢复，不会自动解除，避免危险状态下自己恢复。
+ * 4) 停电机用 Emm_V5_Stop_Now（减速并保持位置），不用 Emm_V5_En_Control 掉使能
+ *    —— 掉使能会失去保持力矩，机械臂会在重力下垮下去，那更危险。
+ *
+ * 延迟：Web 按钮 → HTTP → bridge → USB → 命令队列 → 解析 → CAN，约 10~20ms。
+ * 对"机械臂发疯"这个场景够用，但不是硬实时；真要微秒级得走独立硬件回路。
+ * ------------------------------------------------------------------------- */
+static volatile bool g_estop = false;
+
+void robot_estop_trigger(void)
+{
+    g_estop = true;
+    for (int i = 0; i < ROBOT_MAX_JOINT_NUM; i++) {
+        Emm_V5_Stop_Now(i + 1, false);   /* 非阻塞：只入队，不等待应答 */
+        g_robot.joints[i].velocity = 0;
+    }
+    LOG("ESTOP: all %d joints stopped, motion blocked\n", ROBOT_MAX_JOINT_NUM);
+}
+
+void robot_estop_clear(void)
+{
+    g_estop = false;
+    LOG("ESTOP cleared, motion allowed again\n");
+}
+
+int robot_estop_active(void)
+{
+    return g_estop ? 1 : 0;
+}
+
 static void robot_joint_limit_post_handle(uint8_t joint_id)
 {
 	vTaskDelay(200); // 延时200ms等待限位开关稳定
@@ -123,7 +170,9 @@ uint32_t robot_joint_veloccity_to(uint32_t joint_id, float velocity,\
     struct joint *joint = &g_robot.joints[joint_id];
 	
 	uint8_t dir = (velocity > 0) ? joint->postive_direction : !(joint->postive_direction);
-	ROBOT_STATUS_CLEAR(joint->status, ROBOT_STATUS_LIMIT_ENABLE);
+	/* 注意：原代码在这里 ROBOT_STATUS_CLEAR(joint->status, ROBOT_STATUS_LIMIT_ENABLE)
+	 * 会把限位保护关掉，导致速度模式下限位开关形同虚设。限位保护必须始终有效，
+	 * 因此不在此清限位使能。 */
 	uint32_t addr = joint_id + 1; // 各关节CAN地址从1开始
 
 	// 计算电机速度，单位：rpm. 驱动器会将_velocity/10作为真实速度，从而实现0.1RPM精度控制，因此计算时我们需要提前乘以10
@@ -240,13 +289,70 @@ static void robot_joint_limit_set_input(uint8_t joint_id)
 
 static void robot_joint_limit_set_irq(uint8_t joint_id)
 {
-	// 设置为上下升沿触发
-    HAL_GPIO_DeInit(g_robot.joints[joint_id].limit_gpio_port, g_robot.joints[joint_id].limit_gpio_pin);
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = g_robot.joints[joint_id].limit_gpio_pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(g_robot.joints[joint_id].limit_gpio_port, &GPIO_InitStruct);
+	/* 常闭 NC 开关（沿用原项目 KW11-3Z 接法）：COM→GND，NC→GPIO，NO 悬空。
+	 * 未按压时 NC 闭合，GPIO 被拉到 GND（低）；按压时 NC 断开，内部上拉把
+	 * GPIO 拉高（高）。因此 GPIO_PIN_SET = 已触发（按压）。
+	 *
+	 * 2026-10-28 改为轮询检测，此函数退化成纯输入配置。
+	 *
+	 * 原来这里是 GPIO_MODE_IT_RISING，必须删掉，原因是硬件限制：
+	 * SYSCFG_EXTICR 给每条 EXTI 线只有 4 bit 的端口选择字段（PA=0..PH=7），
+	 * 一条线只能选一个端口。而本方案里 J2=PA02 与 J5=PD02 同为引脚号 2、
+	 * 同一条 EXTI2 线 —— 已实测证明：后调用 HAL_GPIO_Init 的那个会把前一个的
+	 * 路由静默覆盖，被覆盖的那个中断永远不触发（读 EXTICR1 可见 0x300→0x000）。
+	 * 这不是回调里能绕过的，根因在硬件。
+	 *
+	 * 轮询读 HAL_GPIO_ReadPin(端口, 引脚)，端口+引脚组合唯一，同号引脚也分得清。
+	 * 边沿检测见 robot_limit_poll()。
+	 *
+	 * 保留本函数名与调用点不变，是为了让 robot_joint_reset() 的流程一行不改。 */
+    robot_joint_limit_set_input(joint_id);
+}
+
+/* -------------------------------------------------------------------------
+ * 限位轮询（2026-10-28 新增）
+ *
+ * 由 main.c 的 HAL_TIM_PeriodElapsedCallback() 在 TIM6 的 1kHz 中断里调用。
+ * TIM6 本就是 HAL timebase（HAL_GetTick 用它），不额外占定时器、不占新中断，
+ * 且优先级高，不会被 FreeRTOS 任务饿死 —— 比用任务 + vTaskDelay 更可靠
+ * （vTaskDelay 的周期不保证，高优先级任务跑久了轮询会被无限推迟）。
+ *
+ * 成本：6 次 IDR 读 + 边沿比较 ≈ 50~100 周期；1kHz 下 ≈ 0.07% CPU（HCLK 137.5MHz），
+ * 连中断进出算一起约 0.22%。可以忽略。
+ *
+ * 延迟：从 EXTI 的 ~50µs 变成最多 1ms。复位转速 10rpm(=60°/s) 下过冲 0.06°，
+ * 机械上无感。
+ *
+ * 注意 J6(PE14) 没有接线（BOM 只有 5 个开关），悬空被上拉拉高会持续读到 SET，
+ * 但 robot_joint_limit_happend() 开头的 ROBOT_STATUS_LIMIT_ENABLE 检查会让它
+ * 直接返回，不会误停电机。
+ * ------------------------------------------------------------------------- */
+static GPIO_PinState g_limit_prev[ROBOT_MAX_JOINT_NUM];
+
+void robot_limit_poll(void)
+{
+    /* 时序保护：TIM6 中断在 main() 的 HAL_Init() 里就被 HAL_InitTick() 使能了，
+     * 而 g_robot.joints[] 要等到 MX_FREERTOS_Init() -> robot_init() 里才 memcpy 填充。
+     * g_robot 是全局量零初始化，所以这段窗口里 limit_gpio_port 还是 NULL，
+     * HAL_GPIO_ReadPin(NULL, pin) 会解引用空指针直接 HardFault。
+     * 原来的 EXTI 方案没这个问题（NVIC 是 LimitSwitch_Init() 里才开的，晚于 HAL_Init），
+     * 轮询挂在 TIM6 上才引入这个窗口，所以这里必须挡一下。
+     * robot_init() 里的 memcpy 在队列创建之前，故端口指针非空即代表 joints 已就绪。 */
+    if (g_robot.joints[0].limit_gpio_port == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < ROBOT_MAX_JOINT_NUM; i++)
+    {
+        GPIO_PinState now = HAL_GPIO_ReadPin(g_robot.joints[i].limit_gpio_port,
+                                             g_robot.joints[i].limit_gpio_pin);
+        /* 上升沿 = 开关被按压（NC 断开，内部上拉拉高） */
+        if ((now == GPIO_PIN_SET) && (g_limit_prev[i] != GPIO_PIN_SET))
+        {
+            robot_joint_limit_happend((uint8_t)i);
+        }
+        g_limit_prev[i] = now;
+    }
 }
 
 static GPIO_PinState robot_get_limit_status(uint8_t joint_id)
@@ -265,6 +371,9 @@ static void robot_joint_reset(uint8_t joint_id)
     state = robot_get_limit_status(joint_id); // 读取限位开关状态
     robot_joint_limit_set_irq(joint_id); // 设置为中断模式
 
+    /* 常闭 NC 开关（沿用原项目 KW11-3Z 接法）：COM→GND，NC→GPIO，NO 悬空。
+     * 未按压时 NC 闭合，GPIO 被拉到 GND（低）；按压时 NC 断开，内部上拉把
+     * GPIO 拉高（高）。因此 GPIO_PIN_SET 表示限位开关已触发（按压）。 */
     if (state == GPIO_PIN_SET) { // 限位开关已触发, 无需复位
         LOG("joint %d limit switch already happend\n", joint_id);
         Emm_V5_Reset_CurPos_To_Zero(joint_id + 1); // 关节复位
@@ -273,18 +382,26 @@ static void robot_joint_reset(uint8_t joint_id)
 
     robot_joint_rotate_to(joint_id, reset_dir, ROBOT_RESET_DEFAULT_ANGLE, ROBOT_RESET_DEFAULT_VELOCITY, 
                                 ROBOT_RESET_DEFAULT_ACCELERATION, false);
-    // 逆时针旋转，直到检测到限位开关
-	while (!ROBOT_STATUS_IS(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_HAPPENED)) {
+    /* 逆时针旋转，直到检测到限位开关。必须有总超时，否则限位永不触发会死循环
+     * 且电机持续转动到机械撞限位。200ms × 60 = 12s 上限。 */
+    for (int i = 0; i < 60; i++) {
+        if (ROBOT_STATUS_IS(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_HAPPENED)) {
+            vTaskDelay(ROBOT_CAN_DELAY);
+            Emm_V5_Reset_CurPos_To_Zero(joint_id + 1); // 关节复位
+            return;
+        }
         vTaskDelay(200); // 等待关节转动
-	}
-    vTaskDelay(ROBOT_CAN_DELAY);
-    Emm_V5_Reset_CurPos_To_Zero(joint_id + 1); // 关节复位
+    }
+    LOG("joint %d reset timeout, limit switch never triggered\n", joint_id);
+    robot_joint_stop(joint_id);
+    ROBOT_STATUS_CLEAR(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_HAPPENED);
 }
 
-/* 复位所有关节 */
+/* 复位所有关节
+ * BOM 只有 5 个限位开关（KW11-3Z-A×3 + KW11-3Z-B×2），第 6 轴无开关，
+ * 循环从 ROBOT_MAX_JOINT_NUM - 2 开始即跳过第 6 轴（index 5）。 */
 static void robot_joint_hard_reset(void)
 {   
-    // todo: 后面不用-2，直接从ROBOT_MAX_JOINT_NUM - 1开始
     for (int i = ROBOT_MAX_JOINT_NUM - 2; i >= 0; i--) {
         ROBOT_STATUS_SET(g_robot.joints[i].status, ROBOT_STATUS_LIMIT_ENABLE);
 		robot_joint_reset(i);
@@ -583,6 +700,13 @@ static int robot_pid_run(struct position *path, int path_size, float *result)
 
 	start_time = HAL_GetTick();
 	for (p = 1; p < path_size; p++) {
+		/* 急停中止：必须两个循环都查。外层管"还有没有下一个路径点"，
+		   内层管"当前这个点还在持续发指令" —— 内层才是真正驱动电机的地方，
+		   只查外层的话当前点会一直发到 node_end_time 才停。 */
+		if (g_estop) {
+			LOG("ESTOP: pid run aborted at path node %d/%d\n", p, path_size);
+			return 1;
+		}
 		node_end_time = start_time + ROBOT_INTERPOLATION_TIME_RESOLUTION * p; // 本次path node结束时间, 为绝对时间
 		for (int j = 0; j < ROBOT_MAX_JOINT_NUM; j++) { // 初始化
 			target_angle[j] = robot_angle_normalize(result[p * ROBOT_MAX_JOINT_NUM + j]);
@@ -590,6 +714,10 @@ static int robot_pid_run(struct position *path, int path_size, float *result)
 		}
 
 		while(HAL_GetTick() < node_end_time) { // 等待本次path node结束
+			if (g_estop) {
+				LOG("ESTOP: pid period aborted at path node %d/%d\n", p, path_size);
+				return 1;
+			}
 			robot_pid_one_period(target_angle, intg_diff, pre_diff, total_error, 6);
 		}
 		robot_mqtt_joints_sync();
@@ -631,6 +759,13 @@ static void robot_control_task(void *arg)
 	struct robot_event event = {0};
 	// 从队列中取出事件并处理
     while(xQueueReceive(g_robot.event_queue, &event, portMAX_DELAY) == pdPASS) {
+        /* 急停中：丢弃队列里所有待执行事件，不再驱动任何电机。
+           必须在这里挡一道 —— robot_pid_run() 的中止检查只能中断"正在跑"的
+           插值，挡不住"排队中"的事件；不丢的话急停解除后它们会立刻执行。 */
+        if (g_estop) {
+            LOG("ESTOP active, dropped event type %d joint %d\n", event.type, event.joint_id);
+            continue;
+        }
         switch (event.type) {
             case ROBOT_JOINT_REL_ROTATE:
 				LOG("[joint_id: %d] ROBOT_JOINT_REL_ROTATE %f\n", event.joint_id, event.param[0]);
@@ -917,10 +1052,17 @@ static int robot_joint_pin2id(uint16_t pin)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    uint32_t joint_id = robot_joint_pin2id(GPIO_Pin);
-    robot_joint_limit_happend(joint_id);
+    int joint_id = robot_joint_pin2id(GPIO_Pin);
+    if (joint_id < 0) {
+        /* 不属于任何关节的 EXTI 线（如 PE0/PE1 误配、或未映射引脚），
+         * 直接返回，避免越界访问 g_robot.joints[]。 */
+        return;
+    }
+    robot_joint_limit_happend((uint8_t)joint_id);
     LOG_FROM_ISR("joint limit switch happened, joint id: %d\n", joint_id);
-   __HAL_GPIO_EXTI_CLEAR_IT(GPIO_Pin); // 清除中断标志位, 减少按键抖动导致的误触发
+    /* 注意：不要在这里调 __HAL_GPIO_EXTI_CLEAR_IT()。
+     * HAL_GPIO_EXTI_IRQHandler() 已经清过 pending 标志再回调，
+     * 再清一次会把两次清之间到来的边沿吞掉。 */
 }
 
 static int robot_mqtt_joints_sync(void)

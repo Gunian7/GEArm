@@ -9,6 +9,8 @@ static int robot_soft_reset_handle(float *param);
 static int robot_rel_rotate_handle(float *param);
 static int robot_auto_handle(float *param);
 static int robot_abs_rotate_handle(float *param);
+static int robot_estop_handle(float *param);
+static int robot_estop_clear_handle(float *param);
 
 void robot_mqtt_handle(struct robot_cmd *cmd)
 {
@@ -89,6 +91,22 @@ static int robot_hard_reset_handle(float *param)
 	return robot_send_reset_event(true);	
 }
 
+/* 急停：立即停所有电机并阻塞后续动作。见 robot.c 急停小节的设计说明。 */
+static int robot_estop_handle(float *param)
+{
+	(void)param;
+	robot_estop_trigger();
+	return pdPASS;
+}
+
+/* 解除急停。必须人工显式调用，固件不会自动恢复。 */
+static int robot_estop_clear_handle(float *param)
+{
+	(void)param;
+	robot_estop_clear();
+	return pdPASS;
+}
+
 static int robot_soft_reset_handle(float *param)
 {
 	(void)param;
@@ -141,6 +159,8 @@ static struct robot_cmd_info robot_uart1_cmd_table[] = {
 	{"rel_rotate", robot_rel_rotate_handle},
 	{"auto", robot_auto_handle},
 	{"hard_reset", robot_hard_reset_handle},
+	{"estop", robot_estop_handle},
+	{"estop_clear", robot_estop_clear_handle},
 	{"soft_reset", robot_soft_reset_handle},
 	{"zero", robot_zero_handle},
 	// {"time_func", robot_time_func_handle},

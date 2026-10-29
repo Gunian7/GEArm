@@ -24,6 +24,8 @@
 #include "rng.h"
 #include "usart.h"
 #include "gpio.h"
+#include "robot.h"
+#include "usb_device.h"   /* 2026-10-28 新增：USB CDC 控制链路 */
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -104,6 +106,13 @@ int main(void)
   MX_FDCAN1_Init();
   MX_RNG_Init();
   /* USER CODE BEGIN 2 */
+  /* USB CDC 控制链路（2026-10-28 新增）。
+     放在这里而不是 MX_GPIO_Init 生成区，原因和 LimitSwitch_Init 一样：
+     .ioc 里没有声明 USB 外设，放生成区会被 CubeMX 重新生成时静默删掉。
+     枚举后 PC 上会出现一个 COM 口（VID 0483 / PID 5740），Web/bridge 走这条链路。 */
+  MX_USB_DEVICE_Init();
+
+  LimitSwitch_Init();  /* 限位开关 EXTI NVIC + GPIO 时钟（必须在 USER CODE 区，不可放 MX_GPIO_Init 生成区） */
   
   // FDCAN Filter Configuration (Accept All)
   FDCAN_FilterTypeDef sFilterConfig;
@@ -253,10 +262,28 @@ void MPU_Config(void)
   * @param  htim : TIM handle
   * @retval None
   */
+/* ===================== USB CDC 中断转发（2026-10-28 新增）=====================
+ * 启动文件对 OTG_HS 向量只提供 weak 默认实现（Infinite_Loop 死循环）。
+ * 没有这个强实现，USBD_Start() 之后第一个 USB 中断就会把 CPU 停死在死循环里，
+ * 主循环再也不跑 —— 表现为"USB 枚举出来了但发什么都不回应"。
+ * hpcd_USB_OTG_HS 定义在 usb/Target/usbd_conf.c，没有对应的头文件声明，
+ * 所以这里用 extern 引入。 */
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
+void OTG_HS_IRQHandler(void)
+{
+  HAL_PCD_IRQHandler(&hpcd_USB_OTG_HS);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
-
+  if (htim->Instance == TIM6)
+  {
+    /* 限位开关轮询（1kHz）。TIM6 本就是 HAL timebase，不额外占定时器/中断。
+       原来这里靠 EXTI 中断检测，2026-10-28 改为轮询，原因见 robot.c
+       robot_joint_limit_set_irq() 的注释（PA02/PD02 同号，EXTI 线只能路由一个端口）。 */
+    robot_limit_poll();
+  }
   /* USER CODE END Callback 0 */
   if (htim->Instance == TIM6)
   {

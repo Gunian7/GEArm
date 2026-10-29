@@ -1,0 +1,7 @@
+device STM32H723VG
+si SWD
+speed 4000
+Halt
+mem32 0x4000A000, 12
+mem32 0x58024400, 24
+q

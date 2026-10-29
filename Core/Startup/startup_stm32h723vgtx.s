@@ -562,7 +562,12 @@ g_pfnVectors:
    .thumb_set OTG_HS_WKUP_IRQHandler,Default_Handler
 
    .weak      OTG_HS_IRQHandler
-   .thumb_set OTG_HS_IRQHandler,Default_Handler
+   /* 2026-10-28：删掉原来的 .thumb_set OTG_HS_IRQHandler,Default_Handler。
+      .thumb_set 会在汇编期把这个符号硬绑到 Default_Handler，之后即使别的目标文件
+      （main.c）提供了同名强定义，向量表里这一项也仍然指向 Default_Handler，
+      USB 中断进来只会进入死循环 —— 表现为"USB 枚举成功但发什么都不回应"。
+      删掉后链接器按正常规则解析：main.c 的强定义优先，没有强定义时才落到
+      Default_Handler（.weak 保留即可）。 */
 
    .weak      DCMI_PSSI_IRQHandler
    .thumb_set DCMI_PSSI_IRQHandler,Default_Handler

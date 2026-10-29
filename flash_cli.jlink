@@ -1,0 +1,8 @@
+device STM32H723VG
+si SWD
+speed 4000
+r
+h
+loadfile F:\Output\Project_Launch\GEArm\GEArm-H723-Firmware\Debug\GEArm.elf
+r
+q
