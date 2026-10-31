@@ -103,6 +103,28 @@ static void robot_joint_stop_from_isr(uint8_t joint_id);
 
 static robot_time_func g_robot_time_func = time_func_circle; /* 时间函数 */
 
+/* ---------------------------------------------------------------------------
+ * 诊断计数器：定位命令链断点。
+ *
+ * 链路：USB CDC 收一行 → 入 cmd_queue → robot_cmd_service 解析 →
+ *       入 event_queue → robot_control_task → robot_joint_rotate_to
+ *
+ * 之前的现象：每条命令都收到 "+OK" 回显，但 joints[].current_angle 不变。
+ * 回显在 CDC_Receive_HS 里是无条件发的，只证明"USB 中断跑过"，
+ * 不证明命令进了队列。用 J-Link 读这几个全局值就能一次定位卡在哪一级：
+ *   g_dbg_usb_rx        涨、g_dbg_cmd_queued 不涨 → ISR 入队失败
+ *   g_dbg_cmd_queued    涨、g_dbg_cmd_parsed  不涨 → cmd_service 没跑
+ *   g_dbg_cmd_parsed    涨、g_dbg_event_queued 不涨 → 分发被拒
+ *   g_dbg_event_queued  涨、g_dbg_rotate_called 不涨 → control_task 没跑
+ *   g_dbg_rotate_called 涨但电机不动 → CAN/电机侧问题
+ * ------------------------------------------------------------------------- */
+volatile uint32_t g_dbg_cmd_queued = 0;
+volatile uint32_t g_dbg_cmd_parsed = 0;
+volatile uint32_t g_dbg_event_queued = 0;
+volatile uint32_t g_dbg_rotate_called = 0;
+volatile uint32_t g_dbg_rotate_reject = 0;
+
+
 /* -------------------------------------------------------------------------
  * 急停（2026-10-28 新增）
  *
@@ -198,13 +220,17 @@ uint32_t robot_joint_veloccity_to(uint32_t joint_id, float velocity,\
 static uint32_t robot_joint_rotate_to(uint32_t joint_id, enum dir dir, float angle, float velocity,\
     uint32_t acceleration, bool absolute)
 {
+	g_dbg_rotate_called++;
+
 	if (joint_id >= ROBOT_MAX_JOINT_NUM) {
 		LOG("ERROR: joint_id is out of range");
+		g_dbg_rotate_reject++;
         return 1;
     }
 
 	if (velocity < 0) {
 		LOG("ERROR: velocity is negative");
+		g_dbg_rotate_reject++;
 		return 1;
 	}
 
@@ -913,6 +939,36 @@ static int robot_pid_remote(void)
  * 此函数用于完成机械臂系统的初始化工作，包括初始化关节数据、初始位姿矩阵，
  * 创建事件队列以及启动机械臂控制任务。
  */
+/* ---------------------------------------------------------------------------
+ * 电机上电初始化：闭环位置模式 + 使能
+ *
+ * 为什么必须有：之前固件在 robot_joint_rotate_to() 里直接发 Emm_V5_Pos_Control，
+ * 但从未设过控制模式、也从未使能。Emm_V5 的电机上电后默认不吃位置指令，
+ * 线圈不上电就没有保持转矩——现象是"命令全都到位了（回显、队列、计数器全对），
+ * 但机械臂一动不动"，而且从固件侧看不出任何异常。
+ *
+ * 两个步骤缺一不可：
+ *   Emm_V5_Modify_Ctrl_Mode(addr, false, 2)  2 = 闭环模式（P_Pul 菜单）
+ *   Emm_V5_En_Control(addr, true, false)      使能，线圈上电
+ *
+ * can_SendCmd() 只往 FDCAN TX FIFO 入队、不等应答，所以给没接电机的地址
+ * （CAN 3~6）发指令完全无害，不会阻塞。
+ *
+ * 注意：这会让机械臂带电并产生保持转矩。如果当前构型下某个关节会因此
+ * 受力位移，先用手托住或先点急停。 */
+void robot_motor_enable_all(void)
+{
+    for (uint32_t i = 0; i < ROBOT_MAX_JOINT_NUM; i++) {
+        uint32_t addr = i + 1;              /* 各关节 CAN 地址从 1 开始 */
+        Emm_V5_Modify_Ctrl_Mode((uint8_t)addr, false, 2);   /* 闭环模式 */
+        HAL_Delay(2);
+        Emm_V5_En_Control((uint8_t)addr, true, false);      /* 使能 */
+        HAL_Delay(2);
+    }
+    LOG("motors: closed-loop position mode + enabled (CAN addr 1..%d)\n",
+        ROBOT_MAX_JOINT_NUM);
+}
+
 void robot_init(void)
 {
     /* 初始 */
@@ -951,6 +1007,10 @@ void robot_init(void)
 		return;
 	}
 
+	/* 电机上电：闭环位置模式 + 使能。放在任务创建之后、调度器启动之前，
+	   CAN 外设此时已由 MX_FDCAN1_Init() 初始化完毕，可以安全发帧。 */
+	robot_motor_enable_all();
+
 	// /* 创建 robot remote 任务*/
 	// task_attributes.name = "robot_remote_service";
 	// task_attributes.stack_size = ROBOT_REMOTE_SERVICE_STACK_SIZE;
@@ -980,7 +1040,10 @@ int robot_send_rel_rotate_event(uint8_t joint_id, float angle)
 	event.type = ROBOT_JOINT_REL_ROTATE;
 	event.joint_id = joint_id;
 	event.param[0] = angle;
-    return (int)xQueueSendToBack(g_robot.event_queue, &event, ROBOT_CMD_QUEUE_TIMEOUT);
+    if (xQueueSendToBack(g_robot.event_queue, &event, ROBOT_CMD_QUEUE_TIMEOUT) == pdPASS) {
+        g_dbg_event_queued++;
+    }
+    return (int)pdPASS;
 }
 
 int robot_send_remote_event(void)
@@ -1036,8 +1099,13 @@ void robot_cmd_send_from_isr(char *cmd, enum cmd_type type)
 	robot_cmd.type = type;
 	int len = strlen(cmd);
 	strncpy(robot_cmd.cmd, cmd, (len >= ROBOT_CMD_LENGTH) ? ROBOT_CMD_LENGTH - 1: len);
-	BaseType_t xHigherPriorityTaskWoken;
-    xQueueSendToBackFromISR(g_robot.cmd_queue, &robot_cmd, &xHigherPriorityTaskWoken);
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (xQueueSendToBackFromISR(g_robot.cmd_queue, &robot_cmd, &xHigherPriorityTaskWoken) == pdPASS) {
+        g_dbg_cmd_queued++;
+    }
+    /* 唤醒被命令唤醒的高优先级任务。少了这一句，robot_cmd_service 不会立刻跑，
+       要等下一次 SysTick（1ms）才会被调度——功能上仍会执行，但响应慢一拍。 */
+    portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
 }
 
 static int robot_joint_pin2id(uint16_t pin)

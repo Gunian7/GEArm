@@ -167,6 +167,8 @@ static struct robot_cmd_info robot_uart1_cmd_table[] = {
 	{NULL, NULL},
 };
 
+extern volatile uint32_t g_dbg_cmd_parsed;
+
 void robot_uart1_handle(struct robot_cmd *rb_cmd)
 {
 	static char event_type[20] = {0};
@@ -183,6 +185,7 @@ void robot_uart1_handle(struct robot_cmd *rb_cmd)
 
 	for (int i = 0; robot_uart1_cmd_table[i].event_type != NULL; i++) {
 		if (strcmp(event_type, robot_uart1_cmd_table[i].event_type) == 0) {
+			g_dbg_cmd_parsed++;
 			ret = robot_uart1_cmd_table[i].cmd_func(param);
 			if (ret != pdPASS) {
 				LOG("[ERROR] [jid:%d] event_type:%s param:%.2f %.2f %.2f\n", event_type, param[0], param[1], param[2]);
