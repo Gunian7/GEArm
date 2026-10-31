@@ -56,6 +56,13 @@ CFLAGS = [*CPU, "-Os", "-g3", "-std=gnu11", "-ffunction-sections", "-fdata-secti
 LDFLAGS = [*CPU, "-T", str(ROOT / "STM32H723VGTX_FLASH.ld"),
            "-Wl,--gc-sections", "-Wl,-Map=" + str(OUT / "GEArm.map"),
            "--specs=nano.specs", "--specs=nosys.specs", "-static",
+           # ★ newlib-nano 默认不带浮点的 scanf/printf。必须显式用 -u 把这两个
+           #   桩符号拉进来，否则：
+           #     sscanf("rel_rotate 0 5", "%19s %f %f") -> 静默只转换 1 项，
+           #     param[] 全保持 0 -> steps=0 -> 电机收到"移动 0 个脉冲"，
+           #     回 FD 02（成功）但一动不动。这条曾经把整个排查带偏过一次。
+           #   命令解析全靠 %f，LOG 里也大量 %f，两个都要。
+           "-Wl,-u,_scanf_float", "-Wl,-u,_printf_float",
            "-Wl,--start-group", "-lc", "-lm", "-Wl,--end-group",
            "-Wl,--start-group", "-lgcc", "-Wl,--end-group"]
 
@@ -121,6 +128,16 @@ def main() -> int:
             obuilt.append(obj)
         result["objects"] = len(obuilt)
         run([TOOLCHAIN, *LDFLAGS, *obuilt, "-o", elf], log)
+        # 构建期断言：newlib-nano 的浮点 scanf/printf 必须真的被链接进来。
+        # 少了它们不会报错，只会让 sscanf 静默丢弃 %f、参数保持 0 —— 曾经
+        # 表现为"电机收到 steps=0 的命令，回成功但不动"。宁可这里构建失败。
+        map_text = (OUT / "GEArm.map").read_text(encoding="utf-8", errors="replace")
+        for hook in ("_scanf_float", "_printf_float"):
+            if hook not in map_text:
+                raise RuntimeError(
+                    "link is missing %s: float scanf/printf are unavailable, "
+                    "command parameters will silently parse as 0. "
+                    "Keep -Wl,-u,%s in LDFLAGS." % (hook, hook))
         for fmt, ext in [("ihex", "hex"), ("binary", "bin")]:
             run([BINDIR / "arm-none-eabi-objcopy.exe", "-O", fmt, elf, OUT / ("GEArm." + ext)], log)
         size = run([BINDIR / "arm-none-eabi-size.exe", elf], log)

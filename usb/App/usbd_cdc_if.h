@@ -108,7 +108,8 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_HS;
 uint8_t CDC_Transmit_HS(uint8_t* Buf, uint16_t Len);
 
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
-
+/* 从任意任务向 PC 发一行文本（诊断用）。非阻塞：USB 忙时直接丢弃。 */
+void usb_cdc_send_text(const char *s);
 /* USER CODE END EXPORTED_FUNCTIONS */
 
 /**

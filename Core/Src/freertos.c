@@ -51,7 +51,7 @@
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,   /* 512B 太小：robot_init 要建队列/线程/使能电机 */
   .priority = (osPriority_t) osPriorityNormal,
 };
 

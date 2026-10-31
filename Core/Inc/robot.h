@@ -26,7 +26,7 @@ extern "C" {
 #define ROBOT_CONTROL_TASK_STACK_SIZE       4096
 #define ROBOT_CONTROL_TASK_PRIORITY         (osPriorityRealtime3)
 
-#define ROBOT_CMD_SERVICE_STACK_SIZE        2048
+#define ROBOT_CMD_SERVICE_STACK_SIZE        4096   /* 浮点 scanf 吃栈，2048 太紧 */
 #define ROBOT_CMD_SERVICE_PRIORITY          (osPriorityRealtime2)
 
 #define ROBOT_MQTT_SYNC_TASK_STACK_SIZE     2048
@@ -103,6 +103,10 @@ struct joint
     volatile uint32_t status;           /* 关节状态 */
     float velocity;                     /* 关节速度 */
     float acceleration;                 /* 关节加速度 */
+    /* 不足一个脉冲的余量。Web 端发的是"增量"角度，一次拖动会产生很多很小的
+     * delta；单次不足 1 步时若直接四舍五入成 0 就会丢位移，表现为"慢慢拖
+     * 滑块电机纹丝不动"。这里把余量攒起来，下次一起发。 */
+    float step_residual;
 };
 
 /* 机械臂末端位置 */
@@ -217,6 +221,10 @@ void robot_limit_poll(void);
 void robot_estop_trigger(void);   /* 触发：停所有电机 + 置标志，之后拒绝新动作 */
 void robot_estop_clear(void);     /* 解除：人工显式调用，不会自动恢复 */
 int robot_estop_active(void);     /* 1 = 急停中 */
+
+/* 只读诊断：查询驱动器 3A/35/36/1F 状态，原始回包从 USB 打回 PC。
+ * 不产生任何运动，可安全反复调用。 */
+void robot_diag_query_drive(uint8_t addr);
 
 #ifdef __cplusplus
 }

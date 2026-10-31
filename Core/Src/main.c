@@ -110,15 +110,19 @@ int main(void)
      放在这里而不是 MX_GPIO_Init 生成区，原因和 LimitSwitch_Init 一样：
      .ioc 里没有声明 USB 外设，放生成区会被 CubeMX 重新生成时静默删掉。
      枚举后 PC 上会出现一个 COM 口（VID 0483 / PID 5740），Web/bridge 走这条链路。 */
-  MX_USB_DEVICE_Init();
-
   /* USB PHY 引脚：PA11=DM / PA12=DP 必须显式配成 AF10（USB_OTG_HS）。
      不配的后果：这两个脚停在复位后的 Analog 模式，USB PHY 没接到引脚上，
      表现为"时钟开了、中断有了、USBD_Init 也返回 OK，但 PC 永远枚举不出设备"。
      官方 CtrBoard-H7_USB 例程的 gpio.c / hal_msp.c / usbd_conf.c 一处都没配
      这两个脚（.ioc 里声明了外设但生成代码漏了 GPIO），照抄必踩。
      放在这里而不是 MX_GPIO_Init 生成区，理由同 LimitSwitch_Init：
-     .ioc 里没有声明 USB 外设，放生成区会被 CubeMX 重新生成时静默删掉。 */
+     .ioc 里没有声明 USB 外设，放生成区会被 CubeMX 重新生成时静默删掉。
+
+     ★ 必须在 MX_USB_DEVICE_Init() 之前：USB 核心起来时会按当前引脚模式
+     驱动 PHY，此时 PA11/PA12 若还是 Analog，PHY 就接不到引脚上。
+     之前这里是反的（先 Init 再配 GPIO），靠"主机随后重新枚举"侥幸能用，
+     但反复插拔/重连后会退化成"枚举成功但 OUT 端点不收数据"——
+     WriteFile 失败、cdc_rx_lines 一直是 0，只能重新烧录才能恢复。 */
   {
     GPIO_InitTypeDef usb_gpio;
     usb_gpio.Pin = GPIO_PIN_11 | GPIO_PIN_12;   /* PA11=DM, PA12=DP */
@@ -128,6 +132,8 @@ int main(void)
     usb_gpio.Alternate = GPIO_AF10_OTG1_HS;   /* H7 上叫 OTG1_HS，F4 时代的 USB_HS 名不存在 */
     HAL_GPIO_Init(GPIOA, &usb_gpio);
   }
+
+  MX_USB_DEVICE_Init();
 
   LimitSwitch_Init();  /* 限位开关 EXTI NVIC + GPIO 时钟（必须在 USER CODE 区，不可放 MX_GPIO_Init 生成区） */
   

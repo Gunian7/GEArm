@@ -19,6 +19,7 @@
 #include "robot_cmd.h"
 #include "esp8266_mqtt.h"
 #include "fdcan.h"
+#include "usbd_cdc_if.h"   /* usb_cdc_send_text()：诊断回包打印 */
 
 /* ===========================================================================
  * CAN 发送层（2026-11 重写，按张大头 Emm_V5 / X42S 厂商协议）
@@ -44,6 +45,10 @@
 /* 诊断计数：区分"没发出去"和"发了但电机不回"。
  * J-Link 直接读这三个全局即可定位，不用猜。 */
 volatile uint32_t g_dbg_can_tx_ok   = 0;
+/* robot_joint_rotate_to 最近一次算出的实际值，J-Link 可读，用于核对手册字段 */
+volatile float    g_dbg_last_angle = 0.0f;
+volatile uint32_t g_dbg_last_steps = 0;
+volatile uint32_t g_dbg_last_vel   = 0;
 volatile uint32_t g_dbg_can_tx_busy = 0;   /* TX FIFO 满，帧没发出去 */
 volatile uint32_t g_dbg_can_tx_err  = 0;   /* 其它 HAL 错误 */
 
@@ -69,6 +74,31 @@ static HAL_StatusTypeDef can_send_frame(uint32_t ext_id, const uint8_t *data, ui
     return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, (uint8_t *)data);
 }
 
+/* 帧 trace：置 1 后把每条上线的 CAN 帧原文打到 USB，用于和厂商手册 6.4 节的
+ * 样例逐字节核对（ID、长度、数据）。默认 0，纯只读诊断，不改变发送路径。
+ * 开关方式：用 J-Link 写这个变量，不必加命令——w4 <addr> 1 / w4 <addr> 0。
+ * 注意 can_send_emm 也会被 EXTI 中断调用，trace 开着时不要触发限位/急停。 */
+uint8_t g_dbg_trace = 0;
+
+static void trace_frame(uint32_t id, const uint8_t *d, uint8_t n)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    char t[96];
+    int k = 0;
+    if (g_dbg_trace == 0u) { return; }
+    t[k++]='T'; t[k++]='X'; t[k++]=' '; t[k++]='i'; t[k++]='d'; t[k++]='='; t[k++]='0'; t[k++]='x';
+    t[k++]=hx[(id>>8)&0xFU]; t[k++]=hx[(id>>4)&0xFU]; t[k++]=hx[id&0xFU];
+    t[k++]=' '; t[k++]='l'; t[k++]='n'; t[k++]='=';
+    t[k++]=hx[(n>>4)&0xFU]; t[k++]=hx[n&0xFU];
+    t[k++]=' '; t[k++]='d'; t[k++]='=';
+    for (uint8_t i = 0u; i < n; i++) {
+        if (i != 0u) { t[k++] = ' '; }
+        t[k++]=hx[(d[i]>>4)&0xFU]; t[k++]=hx[d[i]&0xFU];
+    }
+    t[k++]='\r'; t[k++]='\n'; t[k]='\0';
+    usb_cdc_send_text(t);
+}
+
 /* 把一条串口格式命令 [addr, fn, 参数..., 0x6B] 按厂商规则发给电机：
  *   - 剥掉 addr（不进载荷）
  *   - fn 之后每 7 字节一包，每包首字节重带 fn
@@ -90,6 +120,8 @@ HAL_StatusTypeDef can_send_emm(uint8_t addr, const uint8_t *cmd, uint8_t len)
         uint8_t buf[8];
         buf[0] = fn;
         for (uint8_t i = 0; i < take; i++) buf[1u + i] = rest[i];
+
+        trace_frame(((uint32_t)addr << 8) | pkt, buf, (uint8_t)(1u + take));
 
         HAL_StatusTypeDef st = can_send_frame(((uint32_t)addr << 8) | pkt,
                                               buf, (uint8_t)(1u + take));
@@ -232,6 +264,101 @@ int robot_estop_active(void)
     return g_estop ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * 只读诊断：查询驱动器状态，把原始回包从 USB 文本通道打给 PC
+ *
+ * 为什么需要：电机"不动"有两类完全不同的原因 ——
+ *   (1) 固件根本没把帧发出去   → 看 g_dbg_can_tx_ok/busy/err
+ *   (2) 驱动收到了、回了"接收成功 02"，但不执行
+ * 第 (2) 类只能问驱动自己：是否使能、是否到位、是否堵转、当前速度/位置。
+ * 不查这些，就只能猜是接线、菜单还是机械卡死。
+ *
+ * 只发 0x3A/0x35/0x36/0x1F 四条读命令，不产生任何运动，可安全反复调用。
+ * --------------------------------------------------------------------------- */
+static int dbg_put(char *b, int n, const char *s)
+{
+    while (*s != '\0') { b[n++] = *s++; }
+    return n;
+}
+
+static int dbg_hex(char *b, int n, uint32_t v, int digits)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    for (int i = digits - 1; i >= 0; i--) {
+        b[n++] = hx[(v >> (i * 4)) & 0x0Fu];
+    }
+    return n;
+}
+
+/* 发一条读命令并打印回包；超时也打印（超时本身就是结论） */
+static void robot_diag_one(uint8_t addr, SysParams_t sp, const char *tag)
+{
+    char line[144];
+    int n = 0;
+
+    can.rxFrameFlag = false;
+    Emm_V5_Read_Sys_Params(addr, sp);
+
+    uint32_t t0 = HAL_GetTick();
+    while (!can.rxFrameFlag) {
+        if ((HAL_GetTick() - t0) > 80u) {
+            n = dbg_put(line, n, tag);
+            n = dbg_put(line, n, ": <timeout, no reply>\r\n");
+            line[n] = '\0';
+            usb_cdc_send_text(line);
+            return;
+        }
+    }
+
+    uint32_t dlc = can.CAN_RxMsg.DataLength;
+
+    n = dbg_put(line, n, tag);
+    n = dbg_put(line, n, ": id=0x");
+    n = dbg_hex(line, n, can.CAN_RxMsg.Identifier, 3);
+    n = dbg_put(line, n, " dlc=");
+    n = dbg_hex(line, n, dlc, 2);
+    n = dbg_put(line, n, " data=");
+    for (uint32_t i = 0; (i < dlc) && (i < 8u); i++) {
+        if (i != 0u) { line[n++] = ' '; }
+        n = dbg_hex(line, n, can.rxData[i], 2);
+    }
+    line[n++] = '\r';
+    line[n++] = '\n';
+    line[n] = '\0';
+    usb_cdc_send_text(line);
+}
+
+void robot_diag_query_drive(uint8_t addr)
+{
+    char hdr[48];
+    int n = 0;
+
+    n = dbg_put(hdr, n, "qstat addr=");
+    n = dbg_hex(hdr, n, addr, 2);
+    n = dbg_put(hdr, n, "\r\n");
+    hdr[n] = '\0';
+    usb_cdc_send_text(hdr);
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    /* 3A: bit0 使能, bit1 到位, bit2 堵转 —— 判断"有没有通电"的关键 */
+    robot_diag_one(addr, S_FLAG, "flag");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    /* 37: 目标位置。发了位置指令后这里应该变；不变说明驱动没真的接受目标 */
+    robot_diag_one(addr, S_TPOS, "tpos");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    /* 36: 实时位置，连续两次对比能看出有没有位移 */
+    robot_diag_one(addr, S_CPOS, "pos ");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    /* 3C: 位置误差。使能且跟随时应接近 0；很大说明没在跟 */
+    robot_diag_one(addr, S_PERR, "perr");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    /* 35: 实时转速（带符号），能看出是不是在转 */
+    robot_diag_one(addr, S_VEL,  "vel ");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    /* 1F: 固件/硬件版本，顺便确认这台的固件类型 */
+    robot_diag_one(addr, S_VER,  "ver ");
+}
+
 static void robot_joint_limit_post_handle(uint8_t joint_id)
 {
 	vTaskDelay(200); // 延时200ms等待限位开关稳定
@@ -327,9 +454,30 @@ static uint32_t robot_joint_rotate_to(uint32_t joint_id, enum dir dir, float ang
 
     /* 计算旋转步数 */
     // 16细分下发送3200个脉冲电机转一圈
-    uint32_t steps = (uint32_t)fabs(round(rel_angle * joint->reduction_ratio * 3200 / 360));
+    /* 亚步累积：1 脉冲 = 关节 360/(50×3200) = 0.00225°。
+     * Web 端每次拖动发的是"增量" delta，慢拖时单次可能不足一步。
+     * 直接 round 成 0 丢掉，就会表现为"拖动滑块电机完全不动"。
+     * 把余量存进 joint->step_residual 累积，累计位移不丢。 */
+    double want_steps = (double)rel_angle * (double)joint->reduction_ratio * 3200.0 / 360.0
+                        + (double)joint->step_residual;
+    double whole = round(want_steps);
+    uint32_t steps = (uint32_t)fabs(whole);
+    joint->step_residual = (float)(want_steps - whole);
+
+    if (steps == 0u) {
+        /* 还不满一个脉冲：不发。发一条"移动 0 步"只会换来一次 FD 02 空转。 */
+        g_dbg_last_angle = rel_angle;
+        g_dbg_last_steps = 0u;
+        g_dbg_last_vel   = 0u;
+        return 0;
+    }
+
 	uint16_t _velocity = (uint16_t)fabs(velocity * 600 * joint->reduction_ratio / 360.0);
     uint32_t addr = joint_id + 1; // 各关节CAN地址从1开始
+    /* 调试：把实际算出来的量暴露给 J-Link，用来核对手册字段 */
+    g_dbg_last_angle = rel_angle;
+    g_dbg_last_steps = steps;
+    g_dbg_last_vel   = _velocity;
     ROBOT_STATUS_CLEAR(joint->status, ROBOT_STATUS_READY);
     Emm_V5_Pos_Control(addr, _dir, _velocity, (uint8_t)acceleration, steps, false, false);
     return 0;
@@ -1031,6 +1179,12 @@ void robot_motor_enable_all(void)
 
 void robot_init(void)
 {
+    /* 注意：不要在这里做 sscanf 自检。robot_init() 跑在 defaultTask 里，
+     * 而 defaultTask 的栈只有 512 字节；启用浮点 scanf 后 newlib 的
+     * vfscanf 需要数百字节栈，放这儿会直接把栈压爆（现象：开机 ~40ms 后
+     * 卡死在 PendSV、uwTick 不再推进、USB 掉线）。
+     * 自检已移到 robot_cmd_service（4KB 栈）里做。 */
+
     /* 初始 */
     memcpy(g_robot.joints, g_joints_init, sizeof(g_joints_init));
     memcpy(g_robot.T, T_0_6_reset, sizeof(T_0_6_reset));
@@ -1243,6 +1397,12 @@ static int robot_mqtt_joints_sync(void)
 void robot_cmd_service(void)
 {
 	struct robot_cmd rb_cmd = {0};
+
+	/* 命令解析自检（见 robot_cmd.h）。必须放在这个任务里做：
+	 * 浮点 scanf 吃栈较多，本任务 4KB 栈足够；放进 512B 的 defaultTask 会爆栈。
+	 * 结果写 g_dbg_scanf_float_ok / g_dbg_selftest_angle，J-Link 可读，
+	 * 不依赖 USB 通道。 */
+	robot_cmd_selftest();
 
 #if defined(ROBOT_MQTT_ENABLE) &&  (ROBOT_MQTT_ENABLE == 1)
 	int ret;

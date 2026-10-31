@@ -296,6 +296,41 @@ static void usb_cmd_echo_line(const char *cmd)
   }
 }
 
+/* 诊断输出的通用文本通道：从任务上下文调用，把一行文本送到 PC。
+ * 与上面的 +OK 回显区别：那个在 ISR 里跑、只回显命令；这个给
+ * "查询驱动器状态" 这类需要打印十六进制回包的地方用。
+ * 同样不做重试：USB 忙就丢，诊断输出不值得阻塞控制链。 */
+void usb_cdc_send_text(const char *s)
+{
+  static uint8_t buf[160];
+  uint16_t n = 0U;
+
+  if (s == NULL) { return; }
+
+  /* 拒绝从异常上下文（中断/ISR）调用。
+   *
+   * CDC_Transmit_HS 不可重入：它改 hcdc->TxState / PMA 缓冲。如果 EXTI 里
+   * （限位、急停）的 CAN trace 和任务里的输出同时发，USB 栈会被写坏，
+   * 之后的典型症状就是"枚举正常、TX 还偶尔能出，但 PC 再也写不进来"——
+   * 和交接里问题 A（WriteFile failed、g_cdc_rx_lines 恒 0）完全对得上。
+   * 诊断输出丢一行毫无影响，USB 被写坏的代价太大。 */
+  if (__get_IPSR() != 0U) { return; }
+
+  while (s[n] != '\0' && n < (uint16_t)(sizeof(buf) - 1U)) {
+    buf[n] = (uint8_t)s[n];
+    n++;
+  }
+  if (n == 0U) { return; }
+
+  /* USB 忙就等一小会儿再发。早先直接丢弃，导致 qstat 这种连续输出只剩最后
+   * 一两行 —— 丢一行诊断输出就等于读数不可信，比慢一点糟糕得多。
+   * 本函数只在任务上下文调用（上面已挡掉 ISR），阻塞几十毫秒无害。 */
+  for (uint32_t i = 0U; i < 50U; i++) {
+    if (CDC_Transmit_HS(buf, n) == USBD_OK) { return; }
+    HAL_Delay(2U);
+  }
+}
+
 /**
   * @brief Data received over USB OUT endpoint are sent over CDC interface
   *         through this function.
