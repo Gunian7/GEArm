@@ -24,29 +24,35 @@ HAL_StatusTypeDef CAN_Send_Msg(uint32_t StdId, uint8_t *pData, uint8_t Len)
 {
     FDCAN_TxHeaderTypeDef TxHeader;
 
+    /* 帧长 -> FDCAN DLC 码。
+       0..8 字节：DLC 码就是字节数（经典 CAN 与 FD 通用）。
+       9..12 -> DLC 9，13..16 -> DLC 10，17..20 -> DLC 11，
+       21..24 -> DLC 12，25..32 -> DLC 13，33..48 -> DLC 14，49..64 -> DLC 15。
+       FD 的数据段长度只能取 0-8/12/16/20/24/32/48/64 这几个档位，向上取整。
+
+       原来这里是一个 switch 把所有 Len>8 一律映射成 FDCAN_DLC_BYTES_8，
+       导致 Emm_V5_Pos_Control 的 13 字节命令被砍成 8 字节，
+       末尾的 0x6B 校验字节丢失，电机直接忽略该帧。 */
+    uint32_t dlc;
+    if      (Len <= 8)  dlc = (uint32_t)Len;
+    else if (Len <= 12) dlc = FDCAN_DLC_BYTES_12;
+    else if (Len <= 16) dlc = FDCAN_DLC_BYTES_16;
+    else if (Len <= 20) dlc = FDCAN_DLC_BYTES_20;
+    else if (Len <= 24) dlc = FDCAN_DLC_BYTES_24;
+    else if (Len <= 32) dlc = FDCAN_DLC_BYTES_32;
+    else if (Len <= 48) dlc = FDCAN_DLC_BYTES_48;
+    else                dlc = FDCAN_DLC_BYTES_64;
+
     // 1. 配置 FDCAN 发送头
     TxHeader.Identifier = StdId;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = (Len > 8) ? FDCAN_DLC_BYTES_8 : ((uint32_t)Len << 16); 
-    // 注意: H7 的 DLC 宏定义很怪 (FDCAN_DLC_BYTES_8 = 0x00080000U)，
-    // 这里简单处理：如果 Len <= 8，直接左移 16 位通常能对应上 (比如 8<<16 = 0x80000)，
-    // 但稳妥起见，最好用 switch-case：
-    switch(Len) {
-        case 0: TxHeader.DataLength = FDCAN_DLC_BYTES_0; break;
-        case 1: TxHeader.DataLength = FDCAN_DLC_BYTES_1; break;
-        case 2: TxHeader.DataLength = FDCAN_DLC_BYTES_2; break;
-        case 3: TxHeader.DataLength = FDCAN_DLC_BYTES_3; break;
-        case 4: TxHeader.DataLength = FDCAN_DLC_BYTES_4; break;
-        case 5: TxHeader.DataLength = FDCAN_DLC_BYTES_5; break;
-        case 6: TxHeader.DataLength = FDCAN_DLC_BYTES_6; break;
-        case 7: TxHeader.DataLength = FDCAN_DLC_BYTES_7; break;
-        default: TxHeader.DataLength = FDCAN_DLC_BYTES_8; break;
-    }
-
+    TxHeader.DataLength = dlc;
+    /* 超过 8 字节必须走 FD 帧；8 字节及以内仍用经典 CAN，
+       这样使能、停止这类短命令的行为和以前完全一致。 */
+    TxHeader.FDFormat = (Len > 8) ? FDCAN_FD_CAN : FDCAN_CLASSIC_CAN;
+    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;   // 与 FrameFormat=FD_NO_BRS 一致
     TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader.BitRateSwitch = FDCAN_BRS_OFF; // 经典 CAN 不加速
-    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;  // 经典 CAN 格式
     TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     TxHeader.MessageMarker = 0;
 

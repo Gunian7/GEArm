@@ -39,7 +39,16 @@ void MX_FDCAN1_Init(void)
 
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
-  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  /* FD 模式（不带位速率切换）。
+     为什么必须开 FD：Emm_V5 协议里有 13 字节（Pos_Control）和 20 字节
+     （Origin_Modify_Params）的命令，经典 CAN 一帧最多 8 字节。之前这里是
+     FDCAN_FRAME_CLASSIC，CAN_Send_Msg() 又把所有 Len>8 都映射成 DLC=8，
+     位置指令被砍成 8 字节——第 8~12 字节全丢，包括末尾的 0x6B 校验字节，
+     电机收到残帧直接忽略。现象是"使能指令（6字节）电机有反应，
+     位置指令（13字节）毫无反应"。
+     用 NO_BRS 而不是 BRS：整帧（含数据段）都跑在标称 500kbps，
+     不需要额外配数据段时序，对电机侧的兼容性最稳。 */
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
@@ -55,17 +64,20 @@ void MX_FDCAN1_Init(void)
   hfdcan1.Init.MessageRAMOffset = 0;
   hfdcan1.Init.StdFiltersNbr = 1;
   hfdcan1.Init.ExtFiltersNbr = 0;
+  /* 元素大小必须是 64 字节：FD 帧数据段最长 64 字节。之前全是
+     FDCAN_DATA_BYTES_8，即使把 FrameFormat 改成 FD，RAM 元素也装不下
+     超过 8 字节的帧，电机的多字节回复同样会被截断。 */
   hfdcan1.Init.RxFifo0ElmtsNbr = 32;
-  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_64;
   hfdcan1.Init.RxFifo1ElmtsNbr = 0;
-  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_64;
   hfdcan1.Init.RxBuffersNbr = 0;
-  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_64;
   hfdcan1.Init.TxEventsNbr = 0;
   hfdcan1.Init.TxBuffersNbr = 0;
   hfdcan1.Init.TxFifoQueueElmtsNbr = 0;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_64;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
   {
     Error_Handler();
