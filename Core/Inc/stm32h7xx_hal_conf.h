@@ -106,7 +106,22 @@
   *        (when HSE is used as system clock source, directly or through the PLL).
   */
 #if !defined  (HSE_VALUE)
-#define HSE_VALUE    (25000000UL) /*!< Value of the External oscillator in Hz : FPGA case fixed to 60MHZ */
+/* ★ 达妙 DM-MC02 板载晶振是 24MHz，不是 CubeMX 默认的 25MHz。
+ *   依据：MC02 使用说明书 V1.1 印刷版第 3 页及附录；
+ *         且 serial-test 只读固件以 24MHz 配置实测 9 发 9 收全通
+ *         （若实际是 25MHz，那套配置的实际波特率会偏到 520.8k，电机不可能应答）。
+ *
+ *   为什么必须改：HAL 只用这个宏做算术推算，不会去测真实时钟，所以配错了
+ *   **编译通过、运行不报错、只是波特率静默偏移**。按 25MHz 配、硬件 24MHz 时：
+ *     PLL 输入 = 25/2 = 12.5MHz → VCO 550MHz → FDCAN 内核 PLL1Q = 137.5MHz
+ *     目标 500k 的时序 (prescaler 11, 1+20+4=25 tq) 实际跑在 24MHz 下变成
+ *       VCO 528MHz → 内核 132MHz → 132/(11×25) = 480kbit/s
+ *   偏 4%，远超 CAN 允许的时钟容差（~0.5%），电机完全无法解码 —— 现象就是
+ *   "帧发出去了，但电机毫无反应"。
+ *
+ *   因此 fdcan.c 里的位时序已同步改为 1+19+4=24 tq（132/(11×24)=500k），
+ *   并有 _Static_assert 把 HSE_VALUE 与时序参数锁在一起，改一个漏一个会编译失败。 */
+#define HSE_VALUE    (24000000UL) /*!< DM-MC02 板载 24MHz 晶振 */
 #endif /* HSE_VALUE */
 
 #if !defined  (HSE_STARTUP_TIMEOUT)

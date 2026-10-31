@@ -45,9 +45,10 @@ INCLUDES = [
     "usb/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc",
 ]
 DEFINES = ["USE_PWR_LDO_SUPPLY", "USE_HAL_DRIVER", "STM32H723xx",
-           # USB HS + 依赖的 HAL 模块。HSE_VALUE 不在这里覆盖 —— GEArm 用
-           # Core/Inc/stm32h7xx_hal_conf.h 里的 25MHz（和自己的 .ioc 一致）。
-           # serial-test 工程用的是 24MHz，两个工程晶振设定不同，别照抄。
+           # HSE_VALUE 不在这里覆盖：单一来源是 Core/Inc/stm32h7xx_hal_conf.h，
+           # 那里已经是达妙 MC02 的真实晶振 24MHz（原来误写 25MHz，导致 CAN 实际
+           # 跑 480k 而不是 500k，电机完全收不到）。fdcan.c 里有 _Static_assert
+           # 把 HSE_VALUE 和 CAN 位时序锁在一起，配错会直接编译失败。
            "USE_USB_HS", "HAL_PCD_MODULE_ENABLED"]
 CPU = ["-mcpu=cortex-m7", "-mthumb", "-mfpu=fpv5-d16", "-mfloat-abi=hard"]
 CFLAGS = [*CPU, "-Os", "-g3", "-std=gnu11", "-ffunction-sections", "-fdata-sections",

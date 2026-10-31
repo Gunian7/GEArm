@@ -23,6 +23,37 @@
 /* USER CODE BEGIN 0 */
 /* FDCAN 收发状态实例, 由 robot.c 与 FDCAN 中断回调共用 */
 __IO CAN_t can = {0};
+
+/* ---------------------------------------------------------------------------
+ * 编译期自检：把「HSE_VALUE ↔ PLL ↔ CAN 位时序」三者锁死。
+ *
+ * 这一类错误最难查：配错晶振不会编译失败、不会运行报错、寄存器读出来也"正常"，
+ * 只是波特率静默偏 4%，电机一声不响。所以这里用常量算式在编译期就算一遍：
+ *
+ *   内核频率 = HSE/PLLM × PLLN / PLLQ = HSE / 2 × 44 / 4
+ *   波特率   = 内核频率 / (NominalPrescaler × (1 + TSEG1 + TSEG2))
+ *            = 内核频率 / (11 × 24)
+ *
+ * 下面三个宏必须与 main.c 的 PLL 参数、本文件的位时序参数保持一致；
+ * 任何一处改了而没同步，编译直接失败，不会再溜到板子上。
+ * --------------------------------------------------------------------------- */
+#define GEARM_PLL_M              2u
+#define GEARM_PLL_N              44u
+#define GEARM_PLL_Q              4u
+#define GEARM_CAN_PRESCALER      11u
+#define GEARM_CAN_TSEG1          19u
+#define GEARM_CAN_TSEG2          4u
+
+#define GEARM_CAN_KERNEL_HZ   ((uint32_t)(HSE_VALUE) / GEARM_PLL_M * GEARM_PLL_N / GEARM_PLL_Q)
+#define GEARM_CAN_TQ_PER_BIT  (1u + GEARM_CAN_TSEG1 + GEARM_CAN_TSEG2)
+#define GEARM_CAN_BITRATE     (GEARM_CAN_KERNEL_HZ / (GEARM_CAN_PRESCALER * GEARM_CAN_TQ_PER_BIT))
+
+_Static_assert(GEARM_CAN_BITRATE == 500000u,
+               "FDCAN bitrate must be 500 kbit/s. If you changed HSE_VALUE "
+               "(DM-MC02 is 24 MHz), you must also re-derive PLLM/PLLN/PLLQ "
+               "and NominalPrescaler/TimeSeg1/TimeSeg2 in fdcan.c.");
+_Static_assert(GEARM_PLL_M == 2u && GEARM_PLL_N == 44u && GEARM_PLL_Q == 4u,
+               "These must match SystemClock_Config() in main.c");
 /* USER CODE END 0 */
 
 FDCAN_HandleTypeDef hfdcan1;
@@ -60,7 +91,18 @@ void MX_FDCAN1_Init(void)
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 11;
   hfdcan1.Init.NominalSyncJumpWidth = 4;
-  hfdcan1.Init.NominalTimeSeg1 = 20;
+  /* 位时序：1(同步段) + TSEG1 + TSEG2 = 24 个时间份额
+   *
+   * 达妙 MC02 板载 24MHz 晶振 → PLL M2/N44 → VCO 528MHz
+   *   → FDCAN 内核 PLL1Q = 528/4 = 132MHz
+   *   → tq 时钟 = 132MHz / 11 = 12MHz
+   *   → 波特率   = 12MHz / 24 = 500 kbit/s  ✓ 与驱动菜单 500k 一致
+   *   采样点     = (1+19)/24 = 83.3%
+   *
+   * 原来是 TSEG1=20（共 25 tq），那是按 25MHz 晶振算的：
+   *   137.5MHz/11/25 = 500k。晶振改回 24MHz 后 132/11/25 = 480k，
+   *   偏 4%，电机收不到。所以 TSEG1 从 20 改成 19。 */
+  hfdcan1.Init.NominalTimeSeg1 = 19;
   hfdcan1.Init.NominalTimeSeg2 = 4;
   /* 经典 CAN 不用数据段时序，但 HAL 要求填合法值 */
   hfdcan1.Init.DataPrescaler = 1;
