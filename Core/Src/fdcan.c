@@ -39,16 +39,21 @@ void MX_FDCAN1_Init(void)
 
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
-  /* FD 模式（不带位速率切换）。
-     为什么必须开 FD：Emm_V5 协议里有 13 字节（Pos_Control）和 20 字节
-     （Origin_Modify_Params）的命令，经典 CAN 一帧最多 8 字节。之前这里是
-     FDCAN_FRAME_CLASSIC，CAN_Send_Msg() 又把所有 Len>8 都映射成 DLC=8，
-     位置指令被砍成 8 字节——第 8~12 字节全丢，包括末尾的 0x6B 校验字节，
-     电机收到残帧直接忽略。现象是"使能指令（6字节）电机有反应，
-     位置指令（13字节）毫无反应"。
-     用 NO_BRS 而不是 BRS：整帧（含数据段）都跑在标称 500kbps，
-     不需要额外配数据段时序，对电机侧的兼容性最稳。 */
-  hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
+  /* ---------------------------------------------------------------------------
+   * 经典 CAN（不是 CAN FD）。
+   *
+   * 张大头 Emm_V5 / X42S 的 CAN 协议是**纯经典 CAN**：手册只有"扩展帧、
+   * ID=(Addr<<8)|Packet、超过 8 字节要手工分包"这一套规则，全文没有 CAN FD
+   * 概念（搜 "CAN FD"/"CANFD"/"数据段" 零命中；出现的 26 处 "FD" 全是功能码
+   * 0xFD）。厂商给的 13 字节位置命令拆分样例就是 8B + 5B 两帧，正是经典 CAN
+   * 8 字节上限的写法。
+   *
+   * 之前这里被改成 FDCAN_FRAME_FD_NO_BRS，想用 FD 一帧装下 13 字节——方向错了：
+   * FD 帧的 FDF 位=1，经典 CAN 控制器会按错误帧处理或直接忽略。而且真正让
+   * 位置指令失效的原因不是"一帧装不下"，而是**缺分包逻辑**（见 robot.c
+   * can_send_emm）：13 字节本来就必须拆成 ID 0x100(8B) + ID 0x101(5B)。
+   * --------------------------------------------------------------------------- */
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
@@ -57,27 +62,32 @@ void MX_FDCAN1_Init(void)
   hfdcan1.Init.NominalSyncJumpWidth = 4;
   hfdcan1.Init.NominalTimeSeg1 = 20;
   hfdcan1.Init.NominalTimeSeg2 = 4;
+  /* 经典 CAN 不用数据段时序，但 HAL 要求填合法值 */
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
   hfdcan1.Init.DataTimeSeg2 = 1;
   hfdcan1.Init.MessageRAMOffset = 0;
-  hfdcan1.Init.StdFiltersNbr = 1;
-  hfdcan1.Init.ExtFiltersNbr = 0;
-  /* 元素大小必须是 64 字节：FD 帧数据段最长 64 字节。之前全是
-     FDCAN_DATA_BYTES_8，即使把 FrameFormat 改成 FD，RAM 元素也装不下
-     超过 8 字节的帧，电机的多字节回复同样会被截断。 */
+  /* 只收扩展帧：地址 1..6 各一条过滤项（main.c 里配置）。
+     标准帧过滤项归零——张大头不用标准帧。 */
+  hfdcan1.Init.StdFiltersNbr = 0;
+  hfdcan1.Init.ExtFiltersNbr = 6;
+  /* 经典 CAN 单帧上限 8 字节，元素大小就是 8 字节 */
   hfdcan1.Init.RxFifo0ElmtsNbr = 32;
-  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_64;
+  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
   hfdcan1.Init.RxFifo1ElmtsNbr = 0;
-  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_64;
+  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
   hfdcan1.Init.RxBuffersNbr = 0;
-  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_64;
+  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
   hfdcan1.Init.TxEventsNbr = 0;
+  /* ★ 关键修复：原来 TxBuffersNbr=0 且 TxFifoQueueElmtsNbr=0 —— 一个发送
+   * 缓冲都没分配，HAL_FDCAN_GetTxFifoFreeLevel() 读 TXFQS.TFFL 恒为 0，
+   * 于是 CAN_Send_Msg() 每次都在入队前返回 HAL_BUSY，**一个字节都没上过
+   * 总线**。分配 8 个 FIFO 元素：6 轴使能/停止 + 分包余量。 */
   hfdcan1.Init.TxBuffersNbr = 0;
-  hfdcan1.Init.TxFifoQueueElmtsNbr = 0;
+  hfdcan1.Init.TxFifoQueueElmtsNbr = 8;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_64;
+  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
   {
     Error_Handler();

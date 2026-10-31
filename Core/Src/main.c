@@ -131,16 +131,35 @@ int main(void)
 
   LimitSwitch_Init();  /* 限位开关 EXTI NVIC + GPIO 时钟（必须在 USER CODE 区，不可放 MX_GPIO_Init 生成区） */
   
-  // FDCAN Filter Configuration (Accept All)
-  FDCAN_FilterTypeDef sFilterConfig;
-  sFilterConfig.IdType = FDCAN_STANDARD_ID;
-  sFilterConfig.FilterIndex = 0;
-  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
-  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  sFilterConfig.FilterID1 = 0x000;
-  sFilterConfig.FilterID2 = 0x000; // Mask 0x000: accept all
-  
-  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+  /* ---------------------------------------------------------------------------
+   * FDCAN 过滤器：只收张大头的扩展帧回包
+   *
+   * 厂商协议：ID = (Addr << 8) | Packet，地址 1..6 对应 0x100..0x600。
+   * 配 6 条精确过滤项，每条比对高 21 位（地址部分），低 8 位（包号）放行，
+   * 这样同一电机的多包回包（0x100、0x101…）都能收进来。
+   *
+   * 原来是标准帧 accept-all（IdType=STANDARD, FilterID 全 0），而电机回包是
+   * 扩展帧——靠 GFC 复位默认值才能进 FIFO0，属于"碰巧能用"，不是可靠配置。
+   * --------------------------------------------------------------------------- */
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    FDCAN_FilterTypeDef sFilterConfig;
+    sFilterConfig.IdType       = FDCAN_EXTENDED_ID;
+    sFilterConfig.FilterIndex  = i;
+    sFilterConfig.FilterType   = FDCAN_FILTER_MASK;
+    sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sFilterConfig.FilterID1    = (uint32_t)(i + 1) << 8;   /* 0x100, 0x200, ... */
+    sFilterConfig.FilterID2    = 0x1FFFFF00;               /* 比对地址位，放行包号 */
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
+
+  /* 显式拒收未匹配帧和远程帧，不依赖复位默认值 */
+  if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
+                                   FDCAN_REJECT, FDCAN_REJECT,
+                                   FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK)
   {
     Error_Handler();
   }

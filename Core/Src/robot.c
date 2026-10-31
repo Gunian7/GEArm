@@ -20,48 +20,102 @@
 #include "esp8266_mqtt.h"
 #include "fdcan.h"
 
+/* ===========================================================================
+ * CAN 发送层（2026-11 重写，按张大头 Emm_V5 / X42S 厂商协议）
+ *
+ * 厂商手册（reviews/vendor-local/manual.txt:1239-1246, 1287-1289）：
+ *   1. CAN 通讯帧类型固定为**扩展帧**格式；
+ *   2. ID = (Addr << 8) | Packet，Packet 是第几包，从 0 开始；
+ *      小于等于 7 字节的命令 Packet=0，例如 "01 36 6B" -> ID 0x100，数据 36 6B；
+ *      大于 8 字节的命令必须拆包，例如
+ *        "01 FD 01 0F A0 00 00 01 FA 00 00 00 6B"
+ *        -> ID 0x100 数据 FD 01 0F A0 00 00 01 FA
+ *        -> ID 0x101 数据 FD 00 00 00 6B
+ *   3. 每包数据的第一个字节是功能码（地址后面的那个字节）；
+ *   4. **地址不出现在数据里**。
+ *
+ * 旧实现的三处致命错误（导致电机完全不动）：
+ *   a) IdType = FDCAN_STANDARD_ID —— 电机按扩展 ID 0x100 过滤，标准帧永远收不到；
+ *   b) 把含地址的整块串口命令当载荷 —— 载荷整体错位一字节；
+ *   c) 无分包 —— 13/20 字节命令想一帧发完。
+ * 外加 fdcan.c 里 TxFifoQueueElmtsNbr=0，连入队都过不去（见那里的注释）。
+ * =========================================================================== */
+
+/* 诊断计数：区分"没发出去"和"发了但电机不回"。
+ * J-Link 直接读这三个全局即可定位，不用猜。 */
+volatile uint32_t g_dbg_can_tx_ok   = 0;
+volatile uint32_t g_dbg_can_tx_busy = 0;   /* TX FIFO 满，帧没发出去 */
+volatile uint32_t g_dbg_can_tx_err  = 0;   /* 其它 HAL 错误 */
+
+/* 单帧底层发送：只负责把一个已经拼好的载荷发上总线。
+ * H7 HAL 的 DataLength 就是字节数（0..8），不是左移 16 位的编码。 */
+static HAL_StatusTypeDef can_send_frame(uint32_t ext_id, const uint8_t *data, uint8_t len)
+{
+    FDCAN_TxHeaderTypeDef h = {0};
+
+    if (len > 8) { g_dbg_can_tx_err++; return HAL_ERROR; }   /* 经典 CAN 一帧最多 8 字节 */
+
+    h.Identifier          = ext_id;
+    h.IdType              = FDCAN_EXTENDED_ID;   /* ★ 厂商要求扩展帧 */
+    h.TxFrameType         = FDCAN_DATA_FRAME;
+    h.DataLength          = len;
+    h.FDFormat            = FDCAN_CLASSIC_CAN;   /* ★ 经典 CAN，不是 FD */
+    h.BitRateSwitch       = FDCAN_BRS_OFF;
+    h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+    h.MessageMarker       = 0;
+
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) return HAL_BUSY;
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, (uint8_t *)data);
+}
+
+/* 把一条串口格式命令 [addr, fn, 参数..., 0x6B] 按厂商规则发给电机：
+ *   - 剥掉 addr（不进载荷）
+ *   - fn 之后每 7 字节一包，每包首字节重带 fn
+ *   - ID = (addr << 8) | packet
+ *
+ * 非阻塞：TX FIFO 满就立刻返回 HAL_BUSY，不等待、不自旋。
+ * 因为 robot_joint_stop_from_isr() 会在 EXTI 中断里调用本函数。 */
+HAL_StatusTypeDef can_send_emm(uint8_t addr, const uint8_t *cmd, uint8_t len)
+{
+    if (cmd == NULL || len < 2) { g_dbg_can_tx_err++; return HAL_ERROR; }
+
+    const uint8_t  fn       = cmd[1];        /* 功能码 */
+    const uint8_t *rest     = cmd + 2;       /* 功能码之后的字段 */
+    uint8_t        rest_len = (uint8_t)(len - 2u);
+    uint8_t        pkt      = 0;
+
+    do {
+        uint8_t take = (rest_len > 7u) ? 7u : rest_len;   /* 每包最多 7 字节 + 1 字节功能码 */
+        uint8_t buf[8];
+        buf[0] = fn;
+        for (uint8_t i = 0; i < take; i++) buf[1u + i] = rest[i];
+
+        HAL_StatusTypeDef st = can_send_frame(((uint32_t)addr << 8) | pkt,
+                                              buf, (uint8_t)(1u + take));
+        if (st == HAL_OK) {
+            g_dbg_can_tx_ok++;
+        } else if (st == HAL_BUSY) {
+            g_dbg_can_tx_busy++;
+            return HAL_BUSY;         /* 中途失败：不再发后续包，避免电机收到残缺命令 */
+        } else {
+            g_dbg_can_tx_err++;
+            return st;
+        }
+
+        rest     += take;
+        rest_len -= take;
+        pkt++;
+    } while (rest_len > 0u);
+
+    return HAL_OK;
+}
+
+/* 兼容旧符号：Emm_V5.c 的 can_SendCmd() 传的是 (cmd[0], cmd, len)，
+ * 即"地址 + 含地址的整块命令"，正好匹配 can_send_emm 的入参。 */
 HAL_StatusTypeDef CAN_Send_Msg(uint32_t StdId, uint8_t *pData, uint8_t Len)
 {
-    FDCAN_TxHeaderTypeDef TxHeader;
-
-    /* 帧长 -> FDCAN DLC 码。
-       0..8 字节：DLC 码就是字节数（经典 CAN 与 FD 通用）。
-       9..12 -> DLC 9，13..16 -> DLC 10，17..20 -> DLC 11，
-       21..24 -> DLC 12，25..32 -> DLC 13，33..48 -> DLC 14，49..64 -> DLC 15。
-       FD 的数据段长度只能取 0-8/12/16/20/24/32/48/64 这几个档位，向上取整。
-
-       原来这里是一个 switch 把所有 Len>8 一律映射成 FDCAN_DLC_BYTES_8，
-       导致 Emm_V5_Pos_Control 的 13 字节命令被砍成 8 字节，
-       末尾的 0x6B 校验字节丢失，电机直接忽略该帧。 */
-    uint32_t dlc;
-    if      (Len <= 8)  dlc = (uint32_t)Len;
-    else if (Len <= 12) dlc = FDCAN_DLC_BYTES_12;
-    else if (Len <= 16) dlc = FDCAN_DLC_BYTES_16;
-    else if (Len <= 20) dlc = FDCAN_DLC_BYTES_20;
-    else if (Len <= 24) dlc = FDCAN_DLC_BYTES_24;
-    else if (Len <= 32) dlc = FDCAN_DLC_BYTES_32;
-    else if (Len <= 48) dlc = FDCAN_DLC_BYTES_48;
-    else                dlc = FDCAN_DLC_BYTES_64;
-
-    // 1. 配置 FDCAN 发送头
-    TxHeader.Identifier = StdId;
-    TxHeader.IdType = FDCAN_STANDARD_ID;
-    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = dlc;
-    /* 超过 8 字节必须走 FD 帧；8 字节及以内仍用经典 CAN，
-       这样使能、停止这类短命令的行为和以前完全一致。 */
-    TxHeader.FDFormat = (Len > 8) ? FDCAN_FD_CAN : FDCAN_CLASSIC_CAN;
-    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;   // 与 FrameFormat=FD_NO_BRS 一致
-    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    TxHeader.MessageMarker = 0;
-
-    // 2. 发送
-    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0)
-    {
-        return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, pData);
-    }
-    return HAL_BUSY;
+    return can_send_emm((uint8_t)StdId, (const uint8_t *)pData, Len);
 }
 
 struct robot g_robot;       /* robot实例 */
@@ -1287,7 +1341,12 @@ static int robot_update_current_angle(uint8_t joint_id)
 	taskENTER_CRITICAL();
 	xTaskResumeAll();
 	uint8_t id = (uint8_t)(can.CAN_RxMsg.Identifier >> 8) - 1;
-	if ((can.rxData[0] != 0x36) || (can.rxData[6] != 0x6b) || (id != joint_id)) { // 读取失败
+	/* 严格校验：扩展帧、7 字节（36 + 符号 + 4 字节位置 + 6B）、功能码、校验、地址。
+	 * 补 DataLength 检查是因为短帧会让 rxData[6] 沿用上一次的旧数据，
+	 * 从而把别的帧误判成本次查询的成功应答。 */
+	if ((can.CAN_RxMsg.IdType != FDCAN_EXTENDED_ID) ||
+	    (can.CAN_RxMsg.DataLength != 7u) ||
+	    (can.rxData[0] != 0x36) || (can.rxData[6] != 0x6b) || (id != joint_id)) { // 读取失败
 		taskEXIT_CRITICAL();
 		return 1;
 	}
