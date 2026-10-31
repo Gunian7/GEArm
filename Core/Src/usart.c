@@ -165,8 +165,18 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /* USART1 interrupt Init
+     必须显式设成 5，不能依赖默认值 0（和 USART3 / OTG_HS 同一理由）：
+     HAL_UART_RxCpltCallback() 收到一行 '\n' 后会调
+     robot_cmd_send_from_isr() -> xQueueSendToBackFromISR()，
+     而 FreeRTOS 的 configMAX_SYSCALL_INTERRUPT_PRIORITY = 5<<4 = 0x50。
+     vPortValidateInterruptPriority() 会断言当前中断优先级 >= 0x50；
+     优先级 0 会在收到第一条命令时触发 configASSERT 死循环。
+     注意 CubeMX 生成的这段代码本来没有 SetPriority 调用，
+     也就是一直停在复位默认 0 —— 这是一直存在的隐患。 */
   /* USER CODE BEGIN USART1_MspInit 1 */
-
+    HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE END USART1_MspInit 1 */
   }
   else if(uartHandle->Instance==USART3)
@@ -218,8 +228,15 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
     __HAL_LINKDMA(uartHandle,hdmarx,hdma_usart3_rx);
 
-    /* USART3 interrupt Init */
-    HAL_NVIC_SetPriority(USART3_IRQn, 0, 0);
+    /* USART3 interrupt Init
+       优先级必须是 5 或更高，不能是 0：USART3 的接收回调会调
+       robot_cmd_send_from_isr() -> xQueueSendToBackFromISR()，
+       而 FreeRTOS 的 configMAX_SYSCALL_INTERRUPT_PRIORITY = 5<<4 = 0x50。
+       中断里调用 FreeRTOS API 时，vPortValidateInterruptPriority() 会断言
+       当前中断优先级 >= 0x50；优先级 0 直接触发 configASSERT 死循环
+       （port.c 里 for(;;)），整个固件卡死、USB 和串口同时静默。
+       同理 USART1 与 OTG_HS 也必须 >= 5，见 main.c / usbd_conf.c。 */
+    HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART3_IRQn);
   /* USER CODE BEGIN USART3_MspInit 1 */
 

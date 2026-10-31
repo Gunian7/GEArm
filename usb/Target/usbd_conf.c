@@ -89,7 +89,16 @@ void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
     __HAL_RCC_USB_OTG_HS_CLK_ENABLE();
 
     /* Peripheral interrupt init */
-    HAL_NVIC_SetPriority(OTG_HS_IRQn, 0, 0);
+    /* USB interrupt Init
+       优先级必须是 5 或更高，不能是 0（和 USART1/USART3 同一理由）：
+       CDC_Receive_HS() 收到一行命令后会调 robot_cmd_send_from_isr()
+       -> xQueueSendToBackFromISR()，而 FreeRTOS 的
+       configMAX_SYSCALL_INTERRUPT_PRIORITY = 5<<4 = 0x50。
+       vPortValidateInterruptPriority() 会断言当前中断优先级 >= 0x50；
+       优先级 0 会在收到第一条 USB 命令时触发 configASSERT 死循环，
+       现象是"枚举成功、COM 口能打开，但一发数据板子就彻底没反应"。
+       5 与 FDCAN1_IT0 / DMA1_Stream0 一致。 */
+    HAL_NVIC_SetPriority(OTG_HS_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
   /* USER CODE BEGIN USB_OTG_HS_MspInit 1 */
 
