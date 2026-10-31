@@ -254,6 +254,48 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
   /* USER CODE END 10 */
 }
 
+/* 命令回显：把收到的命令原样回给 PC，让 Web/桥接能确认"板子真的收到了"。
+ *
+ * 为什么必须有：命令通道原来是单向的（收但不回），用户点了急停按钮后
+ * 界面上只能看到"发送成功"，无法区分"命令没发出去"和"发了但板子没反应"。
+ * 机械臂不动的时候这两种情况看起来一模一样，安全相关的操作不该靠猜。
+ *
+ * 格式："+OK <命令>\r\n"。前缀 '+' 是为了和二进制帧协议区分开 ——
+ * bridge 的解析器认 0xA5 帧头，文本行会被单独路由，不会混进坏帧统计。
+ *
+ * 在 ISR 里调用，所以：
+ *  - 不用 snprintf（不可重入），手工拼字符串
+ *  - CDC_Transmit_HS 可能返回 USBD_BUSY（上一次发送还没完成），
+ *    此时直接放弃本次回显。回显只是反馈，丢了不影响命令本身，
+ *    绝不能在这里阻塞或重试。
+ */
+static uint8_t usb_cmd_tx_buf[USB_CMD_RX_BUF_SIZE + 8U];
+static volatile uint32_t g_cdc_rx_lines = 0U;   /* 收到的命令数，J-Link 可读 */
+static volatile uint32_t g_cdc_tx_lines = 0U;   /* 成功回显的命令数，J-Link 可读 */
+
+static void usb_cmd_echo_line(const char *cmd)
+{
+  uint32_t n = 0U;
+  g_cdc_rx_lines++;
+
+  usb_cmd_tx_buf[n++] = (uint8_t)'+';
+  usb_cmd_tx_buf[n++] = (uint8_t)'O';
+  usb_cmd_tx_buf[n++] = (uint8_t)'K';
+  usb_cmd_tx_buf[n++] = (uint8_t)' ';
+
+  /* 原样回显命令内容，超长截断（缓冲区是静态的，绝不能写越界） */
+  uint32_t space = (uint32_t)sizeof(usb_cmd_tx_buf) - n - 2U; /* 留 \r\n */
+  for (uint32_t i = 0U; cmd[i] != 0x00U && i < space; i++) {
+    usb_cmd_tx_buf[n++] = (uint8_t)cmd[i];
+  }
+  usb_cmd_tx_buf[n++] = 0x0DU;
+  usb_cmd_tx_buf[n++] = 0x0AU;
+
+  if (CDC_Transmit_HS(usb_cmd_tx_buf, (uint16_t)n) == USBD_OK) {
+    g_cdc_tx_lines++;
+  }
+}
+
 /**
   * @brief Data received over USB OUT endpoint are sent over CDC interface
   *         through this function.
@@ -288,6 +330,7 @@ static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
     if (Buf[i] == 0x0AU) {          /* 换行：一行结束 */
       usb_cmd_rx_buf[usb_cmd_rx_pos] = 0x00U;
       robot_cmd_send_from_isr((char *)usb_cmd_rx_buf, CMD_TYPE_UART1);
+      usb_cmd_echo_line((char *)usb_cmd_rx_buf);
       usb_cmd_rx_pos = 0U;
     } else if (Buf[i] != 0x0DU) {   /* 回车：忽略 */
       usb_cmd_rx_buf[usb_cmd_rx_pos++] = Buf[i];
