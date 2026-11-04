@@ -1,7 +1,16 @@
 # GEArm
 
-桌面级 6 轴机械臂嵌入式控制系统。运行于达妙 DM-MC02 运动控制板（STM32H723VGT6，Cortex-M7），
-通过 CANFD 总线驱动 6 路闭环步进电机，提供逆运动学求解、轨迹插值、限位保护与急停等完整能力。
+桌面级 6 轴机械臂嵌入式控制系统。运行于达妙 DM-MC02 开发板，
+通过 CANFD 总线驱动 6 路闭环步进电机，目前实现了使用USB总线实现了机械臂的电机通信并能通过本地的Web界面进行控制。
+
+未来开发方向：
+
+1. 硬件和软件限位保护
+2. 机械臂重启后获取当前机械臂位置
+3. 机械臂轨迹规划（正逆运动学求解）
+4. 强化学习轨迹规划（待定）
+5. 机械臂末端夹爪
+6. BC（行为克隆）
 
 ---
 
@@ -13,7 +22,7 @@ GEArm 是一套面向桌面级 6 轴机械臂的完整控制方案，由三部�
 | :--- | :--- | :--- |
 | **嵌入式固件** | `GEArm-H723-Firmware/` | 实时运动控制、逆运动学、CANFD 总线驱动、安全保护 |
 | **上位机桥接服务** | `serial-test/bridge/` | Web 服务、USB CDC 链路管理、命令白名单校验 |
-| **工具链** | `serial-test/*.py` | 构建、单元测试、端到端链路测试、数据录制与导出 |
+| **PC 侧工具链** | `serial-test/` | Web 服务、命令白名单、API 测试、数据录制（详见 `../serial-test/README.md`） |
 
 控制链路：
 
@@ -182,19 +191,20 @@ JLink.exe -CommanderScript verify_cli.jlink -AutoConnect 1 -ExitOnError 1
 
 | 套件 | 覆盖范围 |
 | :--- | :--- |
-| `bridge/test_bridge_api.py` | 桥接服务 API、命令白名单、文本与二进制双编码通路 |
-| `integration_link_test.py` | 上位机到虚拟设备的端到端链路 |
-| `e2e_link_test.py` | 完整链路场景回归 |
+| `bridge/test_bridge_api.py` | 桥接服务 API、命令白名单、文本与二进制双编码通路（26 个，`python -m unittest test_bridge_api`） |
 | `pc_service.py --selftest` | USB 端口发现与协议自检 |
+| `python build_cli.py` | 固件全量构建 + newlib 浮点 scanf/printf 链接自检 |
 
-固件侧另有一组基于 J-Link 的硬件在环验证工具（`exticr_probe.py`、
-`exti_conflict.py`、`pin_drive.py`），用于在不驱动电机的前提下核对引脚路由与寄存器状态。
+> 2026-11-04 清理时删除了 `integration_link_test.py` / `e2e_link_test.py`（已被
+> `bridge/test_bridge_api.py` 取代）和固件侧三个一次性 J-Link 调查脚本
+> （`exticr_probe.py` / `exti_conflict.py` / `pin_drive.py`，结论已固化进
+> `main.h` 与 `gpio.c` 注释）。备份见 `../GEArm-doc-backup-20261104.tar.gz`。
 
 ---
 
 ## 7. 开源致谢
 
-本项目的逆运动学模型与轨迹规划算法借鉴自 **零一造物 ZERO 机械臂**
+本项目的逆运动学模型与轨迹规划算法参考 **零一造物 ZERO 机械臂**
 （gitee `dearxie/zero-robotic-arm`）。原项目面向 STM32F407 平台，
 以其完整的机器人知识体系为桌面级机械臂的开放做出了贡献，特此致谢。
 
@@ -206,3 +216,21 @@ JLink.exe -CommanderScript verify_cli.jlink -AutoConnect 1 -ExitOnError 1
 ## 8. 许可
 
 沿用上游项目的开源许可。
+
+---
+
+## 软件安全（2026-11-04 补充）
+
+| 机制 | 位置 | 说明 |
+|---|---|---|
+| 开机位置同步 | `robot_init()` | 启动时读 6 轴电机实际位置，失败则保留 `g_joints_init` 值。软件限位依赖正确的 `current_angle` 基准 |
+| 软件限位 | `robot_clamp_joint_angle()` | 绝对/相对两条路径都把目标夹到 `[min_angle, max_angle]`。**夹紧而非拒绝**，Web 上按 ± 越界时是"走到限位就停" |
+| 限位 GPIO 初始化 | `gpio.c` `LimitSwitch_Init()` | 6 个限位脚配上拉输入。原为空函数，导致未复位的轴读到悬空电平 |
+| 总线成员门禁 | `robot_can_is_present()` | 不在场的地址直接拒绝，避免无 ACK 帧累积 TEC 导致整条总线 Bus-Off |
+| 急停 | `estop` / `estop_clear` | Web 界面有独立急停按钮 |
+
+**未启用**：`ROBOT_STATUS_LIMIT_ENABLE` 目前只在 `soft_reset`/`hard_reset` 里设置，
+开机后是失效的 —— 等限位开关焊接完成并验证接线后再开。
+
+**只读诊断命令**：`jstat`（6 轴角度/限位/减速比）、`qstat [addr]`（驱动器状态）、
+`probe`（重新探测总线成员）。均可安全反复调用，不产生运动。
