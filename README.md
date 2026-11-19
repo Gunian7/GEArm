@@ -231,7 +231,9 @@ arm-none-eabi-gcc --version
 ```bash
 sudo apt install -y git python3
 git clone https://github.com/Gunian7/GEArm.git
-cd GEArm/GEArm-H723-Firmware
+cd GEArm
+git checkout ubuntu-24.04-migration   # 迁移分支；合并进 main 之后这行可省
+cd GEArm-H723-Firmware
 chmod +x flash.sh verify.sh      # 正常 git clone 已带可执行位，从 zip 解包时才需要
 python3 build_cli.py             # 成功时打印 status: passed，产物在 Debug/
 ./flash.sh                       # 烧录；./verify.sh 读运行态寄存器
