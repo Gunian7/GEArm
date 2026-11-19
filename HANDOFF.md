@@ -331,12 +331,12 @@ joint1 cur=  90.00  limit=  90.00.. 180.00  ratio= 50.89  limit_off
 ?? test_jlink_connection.jlink
 ```
 
-分支与最近提交：
+分支结构（具体 hash 以 `git log` 为准，本文档不钉哈希）：
 
 ```
-ubuntu-24.04-migration  426c04c chore(build): 工具链自动发现 + J-Link 脚本改相对路径
-                        5a10876 wip(firmware): 存档 Ubuntu 24.04 迁移前的板级调试改动
-main                    5a10876 ← 迁移前的存档点
+ubuntu-24.04-migration   迁移工作线 —— 本文档描述的构建/烧录行为都在这个分支上
+main                     迁移前的板级调试存档点（5a10876 是本地的存档提交；
+                         origin/main 尚未推进）
 ```
 
 更早的历史（仅作背景；其中 `33b2e58` 的方向已被 `f420f93` 推翻）：
