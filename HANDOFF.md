@@ -309,22 +309,40 @@ joint1 cur=  90.00  limit=  90.00.. 180.00  ratio= 50.89  limit_off
 
 ---
 
-## 8. 未提交的改动
+## 8. 工作区状态与提交历史
+
+源码**没有未提交改动**（本节旧版写的那份清单已经过期）：
+
+- 迁移前的板级调试改动已进 `main` 的存档提交 `5a10876`；
+- Ubuntu 24.04 迁移改动在 `ubuntu-24.04-migration` 分支上。
+
+工作区只剩下面这些**未跟踪**的一次性诊断文件，故意没有纳入版本库 —— 它们是
+排查过程的中间产物，结论已经固化进源码和本文档：
 
 ```
- M Core/Inc/robot.h          // 诊断函数声明
- M Core/Src/main.c           // USB PHY GPIO 顺序修复
- M Core/Src/robot.c          // trace 开关 + 3 个调试变量
- M Core/Src/robot_cmd.c      // qstat 只读诊断命令
- M usb/App/usbd_cdc_if.c     // usb_cdc_send_text 文本诊断通道
- M usb/App/usbd_cdc_if.h
-?? read_diag.py
+?? J1_LIMIT_SWITCH_TEST.md
+?? USB_CDC_FIX_VERIFICATION.md
+?? build_output.txt
+?? check_cdc_counters.jlink
+?? read_gpio_byte.jlink
+?? read_gpio_clock.jlink
+?? read_j1_gpio.jlink
+?? read_j1_gpio_simple.jlink
+?? test_jlink_connection.jlink
 ```
 
-最近提交：
+分支与最近提交：
+
+```
+ubuntu-24.04-migration  426c04c chore(build): 工具链自动发现 + J-Link 脚本改相对路径
+                        5a10876 wip(firmware): 存档 Ubuntu 24.04 迁移前的板级调试改动
+main                    5a10876 ← 迁移前的存档点
+```
+
+更早的历史（仅作背景；其中 `33b2e58` 的方向已被 `f420f93` 推翻）：
 
 ```
 b56d754 fix(clock): 修正 HSE 为 24MHz 并重算 CAN 位时序，波特率从 480k 回到 500k
 f420f93 fix(can): 按厂商协议分包发送经典 CAN 帧，修复电机无响应
-33b2e58 fix(can): 开启 CAN FD，修复 13 字节位置指令被截断   ← 这条方向错了，已被 f420f93 推翻
+33b2e58 fix(can): 开启 CAN FD，修复 13 字节位置指令被截断   ← 方向错了，已被 f420f93 推翻
 ```
