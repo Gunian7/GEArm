@@ -225,6 +225,17 @@ int robot_estop_active(void);     /* 1 = 急停中 */
 /* 只读诊断：查询驱动器 3A/35/36/1F 状态，原始回包从 USB 打回 PC。
  * 不产生任何运动，可安全反复调用。 */
 void robot_diag_query_drive(uint8_t addr);
+void robot_diag_joints(void);        /* jstat：6 轴的当前角度/软件限位/减速比 */
+
+/* 总线成员探测：bit0..5 = CAN 地址 1..6 是否应答。
+ * 开机自动探测一次；接好新电机后可发 probe 命令重新探测。
+ * 不在场的地址一律不发帧（无 ACK 的帧会累积 TEC，可能导致 Bus-Off）。 */
+extern volatile uint8_t g_can_present_mask;
+int robot_can_probe_present(void);
+int robot_can_is_present(uint8_t addr);
+
+/* 探测总线成员 + 给在场的电机设闭环模式并使能（开机与 probe 命令共用） */
+void robot_motor_enable_all(void);
 
 #ifdef __cplusplus
 }

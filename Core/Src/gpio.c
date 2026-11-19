@@ -66,17 +66,46 @@ void MX_GPIO_Init(void)
   */
 void LimitSwitch_Init(void)
 {
-  /* 限位 GPIO 时钟：GPIOA=PA00/PA02（MX_GPIO_Init 已开过），
-     GPIOE=PE09/PE13/PE14，GPIOD=PD02。
+  /* 限位 GPIO 时钟：GPIOA=PA00/PA02，GPIOE=PE09/PE13/PE14，GPIOD=PD02。
      GPIOC 不再需要（轮询方案改用了舵机排针的脚）。 */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /* 2026-10-28 改为 TIM6 1kHz 轮询检测（robot.c robot_limit_poll），
-     不再使用 EXTI 中断，因此这里删掉全部 NVIC 使能。
-     原来那 6 组 HAL_NVIC_SetPriority/EnableIRQ 一并移除：
-     - PA02 与 PD02 同为引脚号 2，同一条 EXTI 线，SYSCFG_EXTICR 只能路由一个端口，
-       两个都配会互相覆盖（已实测），中断方案下这个引脚组合根本不成立；
-     - 不使能 NVIC 后 exti.c 里的 handler 不会被触发，成为死代码，留着不碍事。 */
+  /* 6 个限位脚全部配成上拉输入。
+   *
+   * 为什么必须在这里配：轮询方案下 TIM6 1kHz 中断从 HAL_Init() 起就在跑，
+   * 而 g_robot.joints[] 要等 MX_FREERTOS_Init() -> robot_init() 才 memcpy 填充。
+   * robot_limit_poll() 只挡了"端口指针还是 NULL"那段窗口，之后就全是真读了 ——
+   * 如果引脚没配过，读的是复位默认的模拟浮空输入，值随机；一旦
+   * ROBOT_STATUS_LIMIT_ENABLE 被置上（hard_reset / soft_reset 之后），
+   * 随机上升沿就会让 robot_joint_limit_happend() 误停电机。
+   *
+   * 原来只靠 robot_joint_reset() 里的 robot_joint_limit_set_input() 现配现用，
+   * 那只覆盖"已经复位过的轴"；没复位过的轴在限位使能后读到的就是悬空电平。
+   *
+   * 用 JOINT_LIMIT_x 宏而不是 g_robot.joints[]：本函数在 main() 里调用，
+   * 早于 robot_init() 的 memcpy，那时候 joints 还是全零、端口指针是 NULL。 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_1_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_2_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_2_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_3_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_3_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_4_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_4_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_5_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_5_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = JOINT_LIMIT_6_Pin;
+  HAL_GPIO_Init(JOINT_LIMIT_6_GPIO_Port, &GPIO_InitStruct);
 }
 /* USER CODE END 2 */

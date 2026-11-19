@@ -17,6 +17,10 @@ static int robot_estop_clear_handle(float *param);
  * 用法：qstat      -> 查地址 1
  *       qstat 2    -> 查地址 2 */
 static int robot_qstat_handle(float *param);
+static int robot_jstat_handle(float *param);
+
+/* 重新探测总线成员（接好新电机后发 probe） */
+static int robot_probe_handle(float *param);
 
 void robot_mqtt_handle(struct robot_cmd *cmd)
 {
@@ -130,6 +134,33 @@ static int robot_qstat_handle(float *param)
 	return pdPASS;
 }
 
+/* jstat：只读诊断，把 6 个轴的当前角度、软件限位范围、减速比打到 USB。
+ * 用来验证"开机位置同步"和"软件限位"是否真的生效：
+ *   开机后第一次 jstat -> cur 应该是电机实际角度，而不是 g_joints_init 的硬编码值
+ *   发一条越界 rel_rotate 后再 jstat -> cur 应该停在 limit 的上/下限上 */
+static int robot_jstat_handle(float *param)
+{
+	(void)param;
+	robot_diag_joints();
+	return pdPASS;
+}
+
+/* 重新探测总线 + 给在场的电机使能。
+ * 用在一颗一颗接线的阶段：新电机接好、配好 ID 之后发 probe，
+ * 它就会进入在场名单，之后的运动指令才发得出去。 */
+static int robot_probe_handle(float *param)
+{
+	char msg[64];
+
+	(void)param;
+	robot_motor_enable_all();       /* 内部先探测，只给在场的使能 */
+
+	snprintf(msg, sizeof(msg), "probe: present mask 0x%02X\r\n",
+	         (unsigned)g_can_present_mask);
+	usb_cdc_send_text(msg);
+	return pdPASS;
+}
+
 static int robot_soft_reset_handle(float *param)
 {
 	(void)param;
@@ -186,7 +217,9 @@ static struct robot_cmd_info robot_uart1_cmd_table[] = {
 	{"estop_clear",    robot_estop_clear_handle,    0},
 	{"soft_reset",     robot_soft_reset_handle,     0},
 	{"zero",           robot_zero_handle,           0},
-	{"qstat",          robot_qstat_handle,          0},   /* 只读诊断：驱动 3A/35/36/3C/37/1F */
+	{"qstat",          robot_qstat_handle,          0},
+	{"jstat",          robot_jstat_handle,          0},   /* 只读诊断：6 轴角度/软件限位/减速比 */
+	{"probe",          robot_probe_handle,          0},   /* 重新探测总线成员并使能在场的电机 */   /* 只读诊断：驱动 3A/35/36/3C/37/1F */
 	// {"time_func", robot_time_func_handle},
 	{NULL, NULL, 0},
 };

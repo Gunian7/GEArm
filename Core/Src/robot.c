@@ -328,6 +328,32 @@ static void robot_diag_one(uint8_t addr, SysParams_t sp, const char *tag)
     usb_cdc_send_text(line);
 }
 
+/* 只读诊断：把 6 个轴的当前角度、软件限位范围、减速比打到 USB。
+ * 用法：jstat
+ *
+ * 为什么用 snprintf 而不是 dbg_put/dbg_hex：这里要打印浮点角度，
+ * dbg_hex 只能打整数。build_cli.py 的 LDFLAGS 里有 -u,_printf_float，
+ * 浮点 snprintf 可用（commit 61c7ff7 之前 newlib-nano 缺这个，
+ * 导致所有运动指令的角度参数都是 0）。
+ *
+ * 这是验证"开机位置同步"和"软件限位"是否生效的主要工具：
+ *   - 开机后第一次 jstat 看 current 是不是电机实际角度（而不是硬编码初值）
+ *   - 发一条越界的 rel_rotate，再看 jstat 确认角度停在限位上 */
+void robot_diag_joints(void)
+{
+    char line[128];
+
+    for (uint32_t i = 0; i < ROBOT_MAX_JOINT_NUM; i++) {
+        struct joint *j = &g_robot.joints[i];
+        snprintf(line, sizeof(line),
+                 "joint%u cur=%7.2f  limit=%7.2f..%7.2f  ratio=%6.2f  %s\r\n",
+                 (unsigned)i, j->current_angle, j->min_angle, j->max_angle,
+                 j->reduction_ratio,
+                 ROBOT_STATUS_IS(j->status, ROBOT_STATUS_LIMIT_ENABLE) ? "LIMIT_EN" : "limit_off");
+        usb_cdc_send_text(line);
+    }
+}
+
 void robot_diag_query_drive(uint8_t addr)
 {
     char hdr[48];
@@ -361,6 +387,13 @@ void robot_diag_query_drive(uint8_t addr)
 
 static void robot_joint_limit_post_handle(uint8_t joint_id)
 {
+	/* USB CDC 通知：限位触发 + 急停
+	 * 格式：!LIMIT_TRIGGERED jX\r\n
+	 * Web 端会解析此消息并弹窗显示 "关节X限位触发，已急停" */
+	char msg[64];
+	snprintf(msg, sizeof(msg), "!LIMIT_TRIGGERED j%d\r\n", joint_id);
+	usb_cdc_send_text(msg);
+
 	vTaskDelay(200); // 延时200ms等待限位开关稳定
 	taskENTER_CRITICAL();
 	// 清除限位状态位
@@ -403,6 +436,30 @@ uint32_t robot_joint_veloccity_to(uint32_t joint_id, float velocity,\
 	return 0;
 }
 
+/* 软件限位：把目标角度夹到关节的 [min_angle, max_angle]。
+ * 超界时夹到最近的限位，而不是拒绝命令——Web 上按 +/− 不会"没反应"，
+ * 同时也永远不会命令电机越过限位。
+ * 返回 1 表示发生了夹紧，调用方应打日志。
+ *
+ * 为什么必须有：robot_joint_rotate_to() 原来只查 joint_id 越界和 velocity<0，
+ * min_angle/max_angle 只在复位路径 robot_angle_map() 里用。
+ * 于是 rel_rotate 0 1000 会让电机无条件转 1000°，没有任何软件拦截。 */
+static int robot_clamp_joint_angle(struct joint *joint, float *target)
+{
+    if (joint == NULL || target == NULL) {
+        return 0;
+    }
+    if (*target < joint->min_angle) {
+        *target = joint->min_angle;
+        return 1;
+    }
+    if (*target > joint->max_angle) {
+        *target = joint->max_angle;
+        return 1;
+    }
+    return 0;
+}
+
 /* 控制关节运动 */
 static uint32_t robot_joint_rotate_to(uint32_t joint_id, enum dir dir, float angle, float velocity,\
     uint32_t acceleration, bool absolute)
@@ -421,11 +478,33 @@ static uint32_t robot_joint_rotate_to(uint32_t joint_id, enum dir dir, float ang
 		return 1;
 	}
 
+	/* 不在场就别发：无 ACK 的帧会累积 TEC，攒到 256 会让整条总线 Bus-Off，
+	 * 那时正在工作的电机会一起失联。重新接好电机后发 probe 刷新即可。 */
+	if (!robot_can_is_present((uint8_t)(joint_id + 1u))) {
+		char msg[80];
+		snprintf(msg, sizeof(msg), "!joint %u not on CAN bus (send 'probe' after wiring)\r\n",
+		         (unsigned)(joint_id + 1u));
+		usb_cdc_send_text(msg);
+		LOG("rotate rejected: addr %u not present\n", (unsigned)(joint_id + 1u));
+		g_dbg_rotate_reject++;
+		return 1;
+	}
+
    float rel_angle = 0;
    uint8_t _dir;
    struct joint *joint = &g_robot.joints[joint_id];
 
     if (absolute) {
+        /* 软件限位：绝对目标夹到 [min_angle, max_angle]。
+         * 夹紧后仍可能与当前角度相同，下面的 ERROR_RANGE 判断会直接返回。 */
+        if (robot_clamp_joint_angle(joint, &angle)) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "!limit j%u abs -> %.2f (range %.2f..%.2f)\r\n",
+                     (unsigned)joint_id, angle, joint->min_angle, joint->max_angle);
+            usb_cdc_send_text(msg);
+            LOG("joint %u abs target clamped to %.2f (limit %.2f..%.2f)\n",
+                joint_id, angle, joint->min_angle, joint->max_angle);
+        }
         rel_angle = angle - joint->current_angle;
 		
 		if (fabs(rel_angle) < ROBOT_JOINT_ANGLE_ERROR_RANGE) {
@@ -443,9 +522,24 @@ static uint32_t robot_joint_rotate_to(uint32_t joint_id, enum dir dir, float ang
 		LOG_FROM_ISR("id:%d current:%f, target:%f, rel:%f dir:%d\n", joint_id, joint->current_angle, angle, rel_angle, dir);
 		joint->current_angle = angle;
     } else {
-        /* 相对角度 */
-        rel_angle = angle;
-        joint->current_angle += (dir == DIR_POSITIVE) ? angle : -angle;
+        /* 相对角度。rel_rotate 走的都是这条，dir 固定 DIR_POSITIVE，符号在 angle 里。
+         * 先按方向算出目标角度，夹到软件限位后再反推实际位移——
+         * 这样 Web 上按 +/− 越界时是"走到限位就停"，而不是"没反应"或"直接冲过去"。
+         * rel_angle 保持原来的符号约定（正 = DIR_POSITIVE 方向），
+         * 因为下面的 steps 计算和 _dir 翻转都以它为准。 */
+        float delta = (dir == DIR_POSITIVE) ? angle : -angle;
+        float want  = joint->current_angle + delta;
+        if (robot_clamp_joint_angle(joint, &want)) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "!limit j%u rel -> %.2f (range %.2f..%.2f)\r\n",
+                     (unsigned)joint_id, want, joint->min_angle, joint->max_angle);
+            usb_cdc_send_text(msg);
+            LOG("joint %u rel target clamped to %.2f (limit %.2f..%.2f)\n",
+                joint_id, want, joint->min_angle, joint->max_angle);
+        }
+        rel_angle = (dir == DIR_POSITIVE) ? (want - joint->current_angle)
+                                          : (joint->current_angle - want);
+        joint->current_angle = want;
 		_dir = (dir == DIR_POSITIVE) ? joint->postive_direction : !(joint->postive_direction);
 		if (rel_angle < 0) {
 			_dir = !_dir;
@@ -489,6 +583,13 @@ static void robot_joint_limit_happend(uint8_t joint_id)
         return;
     }
 
+	// 调试日志：检查限位使能状态
+	char debug_msg[64];
+	snprintf(debug_msg, sizeof(debug_msg), "[DEBUG] Limit j%d: enable=%d\r\n",
+	         joint_id,
+	         ROBOT_STATUS_IS(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_ENABLE) ? 1 : 0);
+	usb_cdc_send_text(debug_msg);
+
     // 限位开关未使能
     if (!ROBOT_STATUS_IS(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_ENABLE)) {
         return;
@@ -498,6 +599,10 @@ static void robot_joint_limit_happend(uint8_t joint_id)
     if (ROBOT_STATUS_IS(g_robot.joints[joint_id].status, ROBOT_STATUS_LIMIT_HAPPENED)) {
         return;
 	}
+
+	// 调试日志：限位确认触发
+	snprintf(debug_msg, sizeof(debug_msg), "[DEBUG] Limit TRIGGERED j%d\r\n", joint_id);
+	usb_cdc_send_text(debug_msg);
 
 	// 该函数仅会在中断中调用，且不存在多个中断同时并发设置一个关节状态位的情况，因此无需使用临界区保护
 	robot_joint_stop_from_isr(joint_id);
@@ -1164,17 +1269,80 @@ static int robot_pid_remote(void)
  *
  * 注意：这会让机械臂带电并产生保持转矩。如果当前构型下某个关节会因此
  * 受力位移，先用手托住或先点急停。 */
+/* ---------------------------------------------------------------------------
+ * 总线成员探测（2026-11 新增）
+ *
+ * 为什么需要：CAN 里"没有节点应答"不是无代价的 —— 一帧没人 ACK 就记一次
+ * 发送错误，TEC += 8。到 128 进错误被动，到 256 直接 Bus-Off，那时**连正常
+ * 工作的电机也一起失联**。
+ *
+ * 而原来的开机序列是无条件给 1~6 号地址各发 2 帧（共 12 帧）。装调阶段经常
+ * 只有 1~2 颗电机接着线，剩下 8~10 帧全是 ACK 错误 —— 实测 TEC 就是这样
+ * 一次开机就冲到 128，把总线推进了错误被动。
+ *
+ * 所以开机先逐个地址问一句版本号，谁应答谁才算"在场"，之后只使能在场的。
+ * 注意：**急停仍然广播给全部 6 个地址**（安全优先，宁可多记几个 ACK 错误）。
+ * --------------------------------------------------------------------------- */
+volatile uint8_t g_can_present_mask = 0x3Fu;   /* bit0..5 = 地址1..6，开机探测后覆盖 */
+
+static int robot_can_ping_addr(uint8_t addr)
+{
+    uint32_t want_id = (uint32_t)addr << 8;
+
+    /* 清掉可能残留的标志，避免把上一帧当成这次的回包 */
+    can.rxFrameFlag = false;
+    Emm_V5_Read_Sys_Params(addr, S_VER);
+
+    uint32_t t0 = HAL_GetTick();
+    while (!can.rxFrameFlag) {
+        if ((HAL_GetTick() - t0) > 60u) {
+            return 0;                        /* 超时 = 不在场 */
+        }
+    }
+    /* 必须核对 ID：总线上任何一帧都会置位 rxFrameFlag */
+    return (can.CAN_RxMsg.Identifier == want_id) ? 1 : 0;
+}
+
+int robot_can_probe_present(void)
+{
+    uint8_t mask = 0u;
+
+    for (uint8_t addr = 1u; addr <= ROBOT_MAX_JOINT_NUM; addr++) {
+        if (robot_can_ping_addr(addr)) {
+            mask |= (uint8_t)(1u << (addr - 1u));
+        }
+        HAL_Delay(2);
+    }
+    g_can_present_mask = mask;
+    LOG("can probe: present mask = 0x%02X (addr 1..%d)\n", mask, ROBOT_MAX_JOINT_NUM);
+    return (int)mask;
+}
+
+int robot_can_is_present(uint8_t addr)
+{
+    if (addr < 1u || addr > ROBOT_MAX_JOINT_NUM) {
+        return 0;
+    }
+    return (g_can_present_mask & (uint8_t)(1u << (addr - 1u))) ? 1 : 0;
+}
+
 void robot_motor_enable_all(void)
 {
+    /* 先探测，只使能在场的电机 —— 见上面"总线成员探测"的说明。
+     * 不在场还硬发，只会把 TEC 推高，最终拖累整个总线。 */
+    uint8_t mask = (uint8_t)robot_can_probe_present();
+
     for (uint32_t i = 0; i < ROBOT_MAX_JOINT_NUM; i++) {
         uint32_t addr = i + 1;              /* 各关节 CAN 地址从 1 开始 */
+        if (!(mask & (uint8_t)(1u << i))) {
+            continue;                       /* 不在场：跳过，不发任何帧 */
+        }
         Emm_V5_Modify_Ctrl_Mode((uint8_t)addr, false, 2);   /* 闭环模式 */
         HAL_Delay(2);
         Emm_V5_En_Control((uint8_t)addr, true, false);      /* 使能 */
         HAL_Delay(2);
     }
-    LOG("motors: closed-loop position mode + enabled (CAN addr 1..%d)\n",
-        ROBOT_MAX_JOINT_NUM);
+    LOG("motors: closed-loop position mode + enabled (present mask 0x%02X)\n", mask);
 }
 
 void robot_init(void)
@@ -1225,15 +1393,58 @@ void robot_init(void)
 	   CAN 外设此时已由 MX_FDCAN1_Init() 初始化完毕，可以安全发帧。 */
 	robot_motor_enable_all();
 
+	/* 给 PC 端一点时间打开 COM 口。开机同步结果和后面的限位提示都走 USB，
+	 * 主机还没打开端口时 CDC_Transmit_HS 会直接丢，日志就永远看不到了。
+	 * 500ms 对机械臂启动无感，但能救回一整页诊断输出。 */
+	vTaskDelay(pdMS_TO_TICKS(500));
+
+	/* 开机同步电机实际位置。
+	 * 为什么必须有：current_angle 原本只来自 g_joints_init 的硬编码值
+	 * （90/90/-90/0/90/0），和电机实际角度可能差很多。
+	 * 上面的软件限位 robot_clamp_joint_angle() 靠 current_angle 判断，
+	 * 基准错了限位就是假的——该拦的时候不拦，不该拦的时候乱拦。
+	 *
+	 * robot_update_current_angle() 内部把 g_joints_init[].current_angle 当作机械零点
+	 * 偏移，所以同步结果是"电机角度/减速比 + 零点偏移"，语义正确。
+	 * 没接电机的地址会 10ms 超时返回 1，保留 g_joints_init 的值，
+	 * 不会卡住启动（6 个关节最坏 60ms）。
+	 * 结果同时送 USB：在 Web 上能直接看到哪些轴真的在线、同步到了多少度。 */
+	for (uint32_t i = 0; i < ROBOT_MAX_JOINT_NUM; i++) {
+		if (robot_update_current_angle((uint8_t)i) != 0) {
+			char msg[96];
+			snprintf(msg, sizeof(msg), "!sync j%u timeout, keep init %.2f\r\n",
+			         (unsigned)i, g_robot.joints[i].current_angle);
+			usb_cdc_send_text(msg);
+			LOG("joint %u angle sync timeout, keep init angle %.2f\n",
+			    i, g_robot.joints[i].current_angle);
+		} else {
+			char msg[96];
+			snprintf(msg, sizeof(msg), "sync j%u -> %.2f (init %.2f)\r\n",
+			         (unsigned)i, g_robot.joints[i].current_angle,
+			         g_joints_init[i].current_angle);
+			usb_cdc_send_text(msg);
+			LOG("joint %u angle synced to %.2f (init %.2f)\n",
+			    i, g_robot.joints[i].current_angle, g_joints_init[i].current_angle);
+		}
+	}
+
 	// /* 创建 robot remote 任务*/
 	// task_attributes.name = "robot_remote_service";
 	// task_attributes.stack_size = ROBOT_REMOTE_SERVICE_STACK_SIZE;
 	// task_attributes.priority = ROBOT_REMOTE_SERVICE_PRIORITY;
 	// g_robot.remote_service_handle = osThreadNew((osThreadFunc_t)robot_remote_service, NULL, &task_attributes);
 	// if (g_robot.remote_service_handle == NULL) {
-	// 	LOG("create robot remote service task failed\n");	
+	// 	LOG("create robot remote service task failed\n");
 	// 	return;
 	// }
+
+	/* 默认使能所有限位开关保护（除了 J5，硬件只有 5 个开关）
+	 * 这样即使不执行 hard_reset，限位保护也会生效 */
+	for (uint32_t i = 0; i < ROBOT_MAX_JOINT_NUM - 1; i++) {
+		ROBOT_STATUS_SET(g_robot.joints[i].status, ROBOT_STATUS_LIMIT_ENABLE);
+	}
+	LOG("Limit protection enabled for joints 0-4\n");
+	usb_cdc_send_text("!limit_protection enabled\r\n");
 }
 
 int robot_send_joints_sync_event(float *angles)

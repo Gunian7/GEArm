@@ -239,7 +239,12 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
     break;
 
   case CDC_SET_CONTROL_LINE_STATE:
-
+    /* Windows CDC 驱动打开 COM 口时会发送此命令设置 DTR/RTS。
+     * pbuf[0] bit0=DTR, bit1=RTS。虚拟串口不需要实际控制硬件信号线，
+     * 但必须响应此命令，否则 Windows 可能拒绝启动数据传输。
+     * 表现为：设备枚举正常、COM 口出现，但 WriteFile 失败。
+     *
+     * 修复方案来自 usb_cdc_fix.md（2024-11-13），对应 HANDOFF.md 问题 A。 */
     break;
 
   case CDC_SEND_BREAK:
@@ -272,6 +277,7 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static uint8_t usb_cmd_tx_buf[USB_CMD_RX_BUF_SIZE + 8U];
 static volatile uint32_t g_cdc_rx_lines = 0U;   /* 收到的命令数，J-Link 可读 */
 static volatile uint32_t g_cdc_tx_lines = 0U;   /* 成功回显的命令数，J-Link 可读 */
+static volatile uint32_t g_cdc_rx_calls = 0U;   /* CDC_Receive_HS 被调用次数，用于诊断接收问题（2024-11-13） */
 
 static void usb_cmd_echo_line(const char *cmd)
 {
@@ -349,6 +355,8 @@ void usb_cdc_send_text(const char *s)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
+  g_cdc_rx_calls++;  /* 诊断计数器：与 g_cdc_rx_lines 对比可判断是否调用了但没解析到完整命令 */
+
   /* GEArm 固件：USB CDC 收到的数据按"文本命令"处理，直接进 USART1 那条命令链路。
      终止条件是 0x0A（换行），与 usart.c 里 USART1 的接收逻辑保持一致；0x0D（回车）忽略。
      攒满一行就补 0x00 交给 robot_cmd_send_from_isr()，由 robot_cmd_service 任务解析。
