@@ -219,7 +219,7 @@ static struct robot_cmd_info robot_uart1_cmd_table[] = {
 	{"zero",           robot_zero_handle,           0},
 	{"qstat",          robot_qstat_handle,          0},
 	{"jstat",          robot_jstat_handle,          0},   /* 只读诊断：6 轴角度/软件限位/减速比 */
-	{"probe",          robot_probe_handle,          0},   /* 重新探测总线成员并使能在场的电机 */   /* 只读诊断：驱动 3A/35/36/3C/37/1F */
+	{"probe",          robot_probe_handle,          0},   /* 重新探测总线成员并使能在场的电机 */
 	// {"time_func", robot_time_func_handle},
 	{NULL, NULL, 0},
 };

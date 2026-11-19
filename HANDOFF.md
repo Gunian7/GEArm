@@ -15,7 +15,7 @@
 | **板载晶振** | **24 MHz**（说明书 V1.1 第 3 页 + 附录） |
 | 电机 | 张大头 Emm42_V5.0 + CAN 模块，CAN 地址 1，16 细分（3200 脉冲/圈） |
 | 关节减速比 | `g_joints_init[0].reduction_ratio = 50` |
-| 工具链 | CubeIDE 1.19.0 自带 GCC 13.3.1（`F:\MCU\CubeIDE\...`） |
+| 工具链 | Windows：CubeIDE 1.19.0 自带 GCC 13.3.1（`F:\MCU\CubeIDE\...`）；Linux：CubeIDE for Linux 或 apt 的 `gcc-arm-none-eabi`，用 `ARM_GCC` / `CUBEIDE_ROOT` 指定（见 §2.1） |
 | 仓库 | `github.com/Gunian7/GEArm`，分支 `main` |
 
 **最容易踩的坑：晶振是 24 MHz，不是 CubeMX 默认的 25 MHz。**
@@ -28,17 +28,60 @@
 ```bash
 # 构建（不需要打开 IDE）
 cd F:\Output\Project_Launch\GEArm\GEArm-H723-Firmware
-python build_cli.py        # 产出 Debug/GEArm.{elf,hex,bin,map} + size/nm 摘要
+py -3 build_cli.py         # 本机 python 不在 PATH 上；Linux 上换成 python3 build_cli.py
+                           # 产出 Debug/GEArm.{elf,hex,bin,map} + size/nm 摘要
 
-# 烧录（J-Link SWD）
+# 烧录（J-Link SWD）——.jlink 里的 loadfile 是相对路径，CWD 必须是仓库根
 "F:\MCU\STM32\Jlink\JLink_V914a\JLink.exe" -CommanderScript flash_cli.jlink -AutoConnect 1 -ExitOnError 1
+"F:\MCU\STM32\Jlink\JLink_V914a\JLink.exe" -CommanderScript verify_cli.jlink -AutoConnect 1 -ExitOnError 1
+
+# Linux（Ubuntu 24.04）：脚本自己 cd 到仓库根，并自动定位 JLinkExe
+./flash.sh                 # 等价于 JLinkExe -CommanderScript flash_cli.jlink ...
+./verify.sh                # 只读读取运行态寄存器，不写 Flash
 ```
+
+`.jlink` 脚本里一律用相对路径（`loadfile Debug/GEArm.elf`）：J-Link Commander 按
+**当前工作目录**解释脚本里的相对路径，所以烧录前必须先 `cd` 到仓库根——
+`flash.sh` / `verify.sh` 已经替你做了这一步。
 
 J-Link Commander 两个必知语法（今天在这上面浪费了很多次）：
 
-1. **脚本路径必须用原生 Windows 路径** `C:\tmp\x.jlink`。写 `/c/tmp/x.jlink` 会报
+1. **命令行上传脚本路径要用原生 Windows 路径** `C:\tmp\x.jlink`。写 `/c/tmp/x.jlink` 会报
    `Could not open J-Link Command File`——J-Link 是原生 Windows 程序，不认 MSYS 路径。
+   这条只影响手动传参；脚本内部的相对路径不受影响。
 2. **写内存用逗号**：`w4 24000608, 1`。空格写法静默失败。
+
+### 2.1 Ubuntu 24.04
+
+**待实机确认**：以下 Linux 步骤尚未在 Ubuntu 机器上实跑。已在本机（Windows）验证的是
+`build_cli.py` 的工具链发现与全量构建，以及 `flash.sh` / `verify.sh` 的查找与参数拼装
+（用一个假的 JLinkExe 顶替，本机没装 J-Link）。
+
+工具链（二选一；`build_cli.py` 按 `ARM_GCC` → CubeIDE 内置 → `PATH` 的顺序找）：
+
+```bash
+# A. STM32CubeIDE for Linux 自带工具链（与 Windows 侧同为 13.3.rel1）
+export CUBEIDE_ROOT=/opt/st/stm32cubeide_1.19.0     # 路径不标准时才需要
+arm-none-eabi-gcc --version                          # 自检
+
+# B. 发行版包
+sudo apt update && sudo apt install -y gcc-arm-none-eabi binutils-arm-none-eabi
+arm-none-eabi-gcc --version
+```
+
+构建 / 烧录：
+
+```bash
+cd GEArm/GEArm-H723-Firmware
+chmod +x flash.sh verify.sh      # 正常 git clone 已带 755，从 zip 解包时才需要
+python3 build_cli.py             # status: passed 即成功
+./flash.sh                       # 需要 SEGGER J-Link 软件，见 README「Ubuntu 24.04」
+```
+
+- Linux 上的 J-Link 可执行文件叫 `JLinkExe`（无 `.exe`），默认装在
+  `/opt/SEGGER/JLink_<版本>/`；Windows 的 `JLink.exe` 在 Linux 上不存在。
+- `flash.sh` 找不到 JLinkExe 时打印安装提示并以非 0 退出；`.jlink` 里的
+  `device` / `si` / `speed` / `h` / `go` / `q` 等命令两个平台通用。
 
 读变量示例：
 

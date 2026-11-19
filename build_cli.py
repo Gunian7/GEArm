@@ -15,18 +15,104 @@ Reads the configuration that CubeIDE stores in .cproject:
              previous build's .map shows were compiled.
 
 Outputs Debug/GEArm.{elf,hex,bin,map} next to the sources, plus size/nm summary.
+
+Toolchain discovery, first hit wins:
+  1. $ARM_GCC            explicit path to the arm-none-eabi-gcc executable
+  2. STM32CubeIDE        $CUBEIDE_ROOT (Windows keeps F:/MCU/CubeIDE as default)
+                         plus /opt/st/stm32cubeide_* on Linux
+  3. $PATH               shutil.which("arm-none-eabi-gcc")
+objcopy/size/nm are taken from the same bin/ directory as the compiler found,
+with the executable suffix of the current platform.
 """
+import glob
 import hashlib
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
-TOOLCHAIN = next(pathlib.Path("F:/MCU/CubeIDE").rglob("arm-none-eabi-gcc.exe"))
-BINDIR = TOOLCHAIN.parent
 OUT = ROOT / "Debug"
 OUT.mkdir(exist_ok=True)
+
+# 工具链在 main() 里现找（find_toolchain），模块导入期不扫盘：这样"找不到
+# 工具链"只会变成一条可读的错误信息，而不是导入期的 StopIteration 堆栈。
+EXE = ".exe" if os.name == "nt" else ""
+GCC_NAMES = ("arm-none-eabi-gcc.exe", "arm-none-eabi-gcc")
+CUBEIDE_GNU_TOOLS = "com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32*"
+
+TOOLCHAIN_HINT = (
+    "请任选一种方式提供工具链后重试：\n"
+    "  1) export ARM_GCC=/path/to/arm-none-eabi-gcc\n"
+    "  2) export CUBEIDE_ROOT=<STM32CubeIDE 安装根目录>，其下需有\n"
+    "       plugins/" + CUBEIDE_GNU_TOOLS + "/tools/bin/arm-none-eabi-gcc\n"
+    "       （Linux 通常是 /opt/st/stm32cubeide_1.19.0）\n"
+    "  3) 把 arm-none-eabi-gcc 放进 PATH（Ubuntu: sudo apt install gcc-arm-none-eabi）\n"
+    "详见 README.md 的「Ubuntu 24.04」小节。")
+
+
+class ToolchainNotFound(RuntimeError):
+    pass
+
+
+def _cubeide_roots():
+    """STM32CubeIDE 安装根目录候选。CUBEIDE_ROOT 一旦设置就以它为准（Windows
+    不再回落到 F:/MCU/CubeIDE）；未设置时 Windows 保留原来的默认路径，并叠加
+    Linux 的 /opt/st/stm32cubeide_*。"""
+    roots = []
+    env = os.environ.get("CUBEIDE_ROOT", "").strip()
+    if env:
+        roots.append(pathlib.Path(env).expanduser())
+    elif os.name == "nt":
+        roots.append(pathlib.Path("F:/MCU/CubeIDE"))
+    roots += [pathlib.Path(p) for p in sorted(glob.glob("/opt/st/stm32cubeide_*"))]
+    return roots
+
+
+def _cubeide_compilers(root):
+    """找出某安装根目录下自带 GNU 工具链里的 gcc。
+
+    Windows 版把 plugins/ 放在 <root>/STM32CubeIDE/ 下、Linux 版直接放在
+    <root>/ 下，所以 plugins 这一层用 ** 递归，不写死层级。
+    """
+    found = []
+    for name in GCC_NAMES:
+        pattern = str(root / "**" / "plugins" / CUBEIDE_GNU_TOOLS / "tools" / "bin" / name)
+        found += [pathlib.Path(p) for p in sorted(glob.glob(pattern, recursive=True))]
+    return [p for p in found if p.is_file()]
+
+
+def find_toolchain():
+    """按 ARM_GCC -> CubeIDE 内置 -> PATH 的顺序返回 arm-none-eabi-gcc 的绝对路径。"""
+    env = os.environ.get("ARM_GCC", "").strip()
+    if env:
+        p = pathlib.Path(env).expanduser()
+        if p.is_file():
+            return p.resolve()
+        # 显式指定却指错了就报错：静默换成另一套工具链的话，版本与浮点 ABI
+        # 的差异在构建阶段完全看不出来，只会在上板后变成怪问题。
+        raise ToolchainNotFound(
+            "ARM_GCC 指向的不是一个文件：%s\n%s" % (env, TOOLCHAIN_HINT))
+
+    roots = _cubeide_roots()
+    for root in roots:
+        for p in _cubeide_compilers(root):
+            return p.resolve()
+
+    found = shutil.which("arm-none-eabi-gcc")
+    if found:
+        return pathlib.Path(found).resolve()
+
+    raise ToolchainNotFound(
+        "找不到 arm-none-eabi-gcc。已查找：ARM_GCC（未设置）；CubeIDE 根目录 %s；PATH。\n%s"
+        % (", ".join(str(r) for r in roots) or "（无）", TOOLCHAIN_HINT))
+
+
+def tool_path(bindir, name):
+    """objcopy/size/nm 与发现到的 gcc 同目录，后缀跟随平台。"""
+    return bindir / ("arm-none-eabi-" + name + EXE)
 
 INCLUDES = [
     "Core/Inc",
@@ -116,8 +202,11 @@ def main() -> int:
     objs = OUT / "obj"
     objs.mkdir(exist_ok=True)
     log = (OUT / "build.log").open("w", encoding="utf8")
-    result = {"compiler": str(TOOLCHAIN), "sources": 0, "objects": 0}
+    result = {"sources": 0, "objects": 0}
     try:
+        TOOLCHAIN = find_toolchain()
+        BINDIR = TOOLCHAIN.parent
+        result["compiler"] = str(TOOLCHAIN)
         elf = OUT / "GEArm.elf"
         srcs = sources()
         result["sources"] = len(srcs)
@@ -139,9 +228,9 @@ def main() -> int:
                     "command parameters will silently parse as 0. "
                     "Keep -Wl,-u,%s in LDFLAGS." % (hook, hook))
         for fmt, ext in [("ihex", "hex"), ("binary", "bin")]:
-            run([BINDIR / "arm-none-eabi-objcopy.exe", "-O", fmt, elf, OUT / ("GEArm." + ext)], log)
-        size = run([BINDIR / "arm-none-eabi-size.exe", elf], log)
-        nm = run([BINDIR / "arm-none-eabi-nm.exe", "-S", "-n", elf], log)
+            run([tool_path(BINDIR, "objcopy"), "-O", fmt, elf, OUT / ("GEArm." + ext)], log)
+        size = run([tool_path(BINDIR, "size"), elf], log)
+        nm = run([tool_path(BINDIR, "nm"), "-S", "-n", elf], log)
         (OUT / "size.txt").write_text(size, encoding="utf8")
         (OUT / "symbols.txt").write_text(nm, encoding="utf8")
         result["size"] = size.strip()

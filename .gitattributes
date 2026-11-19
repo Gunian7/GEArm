@@ -1,0 +1,22 @@
+# 行尾统一：仓库里一律存 LF，Linux 检出（Ubuntu 24.04 构建机）拿到的就是 LF，
+# Windows 检出同样写 LF —— GCC/arm-none-eabi、git、python 都能正确处理，
+# 而 CRLF 会在 Linux 上给 .sh 脚本带来 "bad interpreter: /bin/bash^M"。
+# 提交历史里所有 blob 已经是 LF，所以这条规则不会触发大规模 renormalize。
+* text=auto eol=lf
+
+# 二进制：不转换、不做 diff
+*.pdf -text -diff
+*.a   -text -diff
+*.bin -text -diff
+*.elf -text -diff
+*.hex -text -diff
+*.o   -text -diff
+*.lib -text -diff
+*.map -text -diff
+*.png -text -diff
+*.jpg -text -diff
+*.jpeg -text -diff
+*.ico -text -diff
+*.zip -text -diff
+*.gz  -text -diff
+*.7z  -text -diff
